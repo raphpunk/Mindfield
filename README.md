@@ -11,153 +11,119 @@ A real-time consciousness field detection system that correlates heart rhythm co
 ## Installation
 
 ```bash
-git clone https://github.com/yourusername/mindfield-core.git
-cd mindfield-core
-pip install -r requirements.txt
-```
+ # mindfield-core
 
-### Requirements
-- Python 3.8+
-- Bluetooth adapter
-- Compatible HRV devices (Polar H9/H10, H808S)
+ Consciousness-field experiment toolkit: real-time HRV coherence monitoring coupled with RNG collection and analysis.
 
-### Dependencies
-```
-tkinter
-bleak>=0.21.0
-numpy>=1.24.0
-matplotlib>=3.7.0
-```
+ This application is research / experimental software intended to record HRV coherence across one or more devices, collect random bits (software fallback or optional RTL-SDR source), and correlate intention markers with RNG deviations.
 
-## Quick Start
+ ## Goals
+ - Capture HRV coherence in real time and record synchronized snapshots for RNG correlation.
+ - Provide a compact GUI for running baseline and experiment sessions with exportable data.
+ - Offer optional SDR-based entropy with robust handling and in-app troubleshooting.
 
-```bash
-python3 main_app.py
-```
+ ## Prerequisites
+ - Python 3.8+
+ - A working display (X11 / Wayland) to run the Tkinter GUI
+ - Bluetooth adapter and compatible HRV devices (Polar H9/H10, many chest straps)
 
-1. Click "Scan for Devices" to find HRV monitors
-2. Select which devices to use
-3. Run a 5-minute baseline first
-4. Start experiment and focus intention on affecting the RNG
-5. Mark significant moments with "Mark Intention"
-6. Compare results against baseline
+ Optional for SDR entropy
+ - RTL-SDR USB dongle (Nooelec, Realtek RTL2832U + R820T)
 
-## Usage Modes
+ ## Quick setup
 
-### Baseline Mode
-Establishes your personal RNG baseline without intention:
-- 5-minute collection period
-- No intention/influence attempts
-- Provides comparison data for experiments
+ 1. Clone and create a virtual environment:
 
-### Experiment Mode
-Active consciousness-field interaction:
-- Real-time z-score display
-- Automatic marking at coherence > 0.8
-- Effect size calculation vs baseline
-- Multi-person coherence averaging
+ ```bash
+ git clone https://github.com/raphpunk/Mindfield.git
+ cd Mindfield
+ python3 -m venv .venv
+ source .venv/bin/activate
+ pip install --upgrade pip
+ pip install -r requirements.txt
+ ```
 
-## Data Output
+ 2. Run the GUI:
 
-CSV files contain:
-- Timestamp, mean, z-score, bit count
-- Intention markers with coherence values
-- Baseline comparison statistics
-- Individual session metadata
+ ```bash
+ python3 main_app.py
+ ```
 
-## Statistical Significance
+ ## Basic workflow
+ 1. Click "Scan Devices" to find HRV monitors and connect.
+ 2. Run a short baseline (recommended) using "Run Baseline".
+ 3. Start an experiment session; press "Mark Intention" when appropriate.
+ 4. Export session data (CSV/JSON) for analysis.
 
-- **Z > 2.0**: Significant deviation (p < 0.05)
-- **Z > 3.0**: Highly significant (p < 0.003)
-- **Effect Size**: Percentage shift from baseline mean
+ ## Key files
+ - `main_app.py` — GUI and session orchestration
+ - `hrv_manager.py` — BLE HRV device handling
+ - `rng_collector.py` — bit collection, DRBG support, HRV snapshot recording
+ - `sdr_rng.py` — optional RTL-SDR backed entropy provider
 
-## Architecture
+ ## SDR (RTL-SDR) setup and troubleshooting
 
-```
-mindfield-core/
-├── main_app.py         # GUI and main application logic
-├── hrv_manager.py      # Bluetooth HRV device management
-├── rng_collector.py    # Hardware RNG and statistics
-└── README.md
-```
+ The SDR path is optional. If present, the app will try to use it as an entropy source; otherwise it falls back to the software RNG.
 
-## Research Applications
+ Install system packages (Debian/Ubuntu):
 
-- Consciousness-field coupling experiments
-- Group coherence studies
-- Intention-based RNG influence
-- Presentiment research
-- Global consciousness events
+ ```bash
+ sudo apt-get update
+ sudo apt-get install -y rtl-sdr librtlsdr-dev librtlsdr0
+ ```
 
-## Troubleshooting
+ Grant non-root access (recommended):
 
-**Bluetooth not available**: 
-```bash
-sudo systemctl start bluetooth
-sudo apt install bluez  # Linux only
-```
+ ```bash
+ sudo cp udev/52-rtl-sdr.rules /etc/udev/rules.d/52-rtl-sdr.rules
+ sudo udevadm control --reload-rules
+ sudo udevadm trigger
+ sudo usermod -aG plugdev $USER
+ # Log out and log back in (or run `newgrp plugdev`)
+ ```
 
-**No HRV devices found**: Ensure devices are in pairing mode and not connected to other apps
+ Quick SDR test (verbose):
 
-**Permission errors**: May need to run with sudo on Linux for BLE scanning
+ ```bash
+ source .venv/bin/activate
+ python sdr_rng.py -n 32 --verbose
+ ```
 
-## SDR (Nooelec / RTL-SDR) Setup (optional)
+ ### Common SDR issues and tips
+ - If `rtl_test -t` reports `[R82XX] PLL not locked!`:
+	 - Try a different USB port (avoid unpowered hubs).
+	 - Ensure an antenna is connected.
+	 - Try lower sample rates / smaller read buffers (the app does this automatically when initializing SDR).
+	 - Unload conflicting DVB kernel modules (the app includes an "Apply Driver Fixes" helper under Help → Troubleshooting that can unload modules and install a udev rule and modprobe blacklist; it backs up files and supports undo).
 
-This project can use a Nooelec/RTL-SDR device as an entropy source for seeding the RNG. The SDR path is optional — the software RNG fallback will be used if an SDR is not available.
+ ## New in-app tools
+ - Troubleshooting dialog (Help → Troubleshooting):
+	 - Run `rtl_test -t` as root from the GUI and inspect output.
+	 - Apply Driver Fixes: unload conflicting kernel modules and optionally install udev/modprobe files (creates `.bak` backups).
+	 - Undo Driver Fixes: restore backups or remove created files.
 
-1. Install system packages (Debian/Ubuntu):
+ ## Bluetooth and HRV
+ - Ensure your HRV sensor is in pairing mode and not connected to other apps.
+ - If Bluetooth scanning fails, try enabling the service and checking `rfkill`:
 
-```bash
-sudo apt-get update
-sudo apt-get install -y rtl-sdr librtlsdr-dev librtlsdr0
-```
+ ```bash
+ sudo systemctl enable --now bluetooth
+ rfkill list
+ ```
 
-2. Install Python dependencies in a virtual environment (recommended):
+ ## Export and analysis
+ - Use the Export Session control to save CSV or JSON containing bits, markers, HRV snapshots, and metadata.
+ - For external analysis, tools like Python/pandas or R can ingest the exported files for statistical testing.
 
-```bash
-./scripts/setup-env.sh
-source .venv/bin/activate
-```
+ ## Development notes
+ - Optional Python packages (recommended): `numpy`, `pyrtlsdr`, `matplotlib`, `bleak`.
+ - If you don't need SDR features, you can omit `pyrtlsdr` and `numpy` and the GUI will fall back to software RNG automatically.
 
-3. Allow non-root access to the SDR device (one-time admin step):
+ ## Contributing
+ Contributions welcome. Please open issues or PRs for device support, UI improvements, or analysis tools.
 
-```bash
-sudo cp udev/52-rtl-sdr.rules /etc/udev/rules.d/52-rtl-sdr.rules
-sudo udevadm control --reload-rules
-sudo udevadm trigger
-sudo usermod -aG plugdev $USER
-# Log out and log back in (or run `newgrp plugdev`) to apply group changes.
-```
+ ## License
+ MIT — see `LICENSE`
 
-4. Test SDR availability and collect a seed (verbose):
-
-```bash
-source .venv/bin/activate
-python sdr_rng.py -n 32 --verbose
-```
-
-If the script prints `SDR: used RTL-SDR to collect entropy`, the SDR path is working.
-
-Notes:
-- The SDR-based entropy is whitened (SHA-256) before use and is combined into an internal DRBG. For production/high-assurance use, follow NIST SP800-90 recommendations and run continuous health tests.
-- See `POLKIT_RULES.md` for guidance on polkit rules if you want to manage Bluetooth via DBus without sudo.
-
-## Contributing
-
-This is experimental research software. Pull requests welcome for:
-- Additional HRV device support
-- Alternative RNG sources (hardware/Arduino)
-- Advanced statistical analysis
-- Real-time visualization improvements
-
-## License
-
-MIT License - See LICENSE file
-
-## Acknowledgments
-
-Inspired by the Global Consciousness Project and the intersection of consciousness research with quantum mechanics.
-
----
-
-*For questions or collaboration: [your-email]*
+ ## Contact
+ For questions or collaboration: open an issue or email the repo owner.
