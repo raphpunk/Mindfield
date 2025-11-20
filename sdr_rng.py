@@ -53,17 +53,46 @@ class SDRRNG:
         self.gain = gain
         # Number of complex samples to read per hash cycle (must be even-ish)
         self.samples_per_hash = int(samples_per_hash)
+            self._sdr = None
+            self._open_device()
+
+        def _open_device(self):
+            """Open the RTL-SDR device once and configure it for repeated reads."""
+            if self._sdr is not None:
+                return
+            self._sdr = RtlSdr()
+            self._sdr.sample_rate = float(self.sample_rate)
+            self._sdr.center_freq = float(self.center_freq)
+            self._sdr.gain = self.gain
+
+        def close(self):
+            """Release the underlying RTL-SDR device."""
+            if self._sdr is not None:
+                try:
+                    self._sdr.close()
+                except Exception:
+                    pass
+                finally:
+                    self._sdr = None
+
+        def __del__(self):
+            try:
+                self.close()
+            except Exception:
+                pass
 
     def _collect_raw_bytes(self):
         """Read samples from the SDR and return raw bytes extracted from I/Q LSBs."""
-        sdr = None
         try:
-            sdr = RtlSdr()
-            sdr.sample_rate = float(self.sample_rate)
-            sdr.center_freq = float(self.center_freq)
-            sdr.gain = self.gain
-
-            samples = sdr.read_samples(self.samples_per_hash)
+            if self._sdr is None:
+                self._open_device()
+            samples = self._sdr.read_samples(self.samples_per_hash)
+            # Keep last raw samples for optional spectral analysis
+            try:
+                # store as numpy array reference for later analysis
+                self._last_samples = samples
+            except Exception:
+                self._last_samples = None
             # samples is a numpy array of complex64
             i = np.clip(np.round(np.real(samples) * 127.0), -128, 127).astype(np.int8)
             q = np.clip(np.round(np.imag(samples) * 127.0), -128, 127).astype(np.int8)
@@ -86,12 +115,56 @@ class SDRRNG:
             # packed is shape (N,1) -> flatten
             out = packed.flatten().tobytes()
             return out
-        finally:
-            if sdr is not None:
-                try:
-                    sdr.close()
-                except Exception:
-                    pass
+        except Exception:
+            # Close the device so the next attempt will reopen fresh.
+            self.close()
+            raise
+
+    def get_peak_frequency(self):
+        """Estimate a dominant frequency from the last captured samples.
+
+        Returns center frequency in Hz (float) for the peak, or None if not
+        available. This requires `numpy` to be present and that `_last_samples`
+        contains the most recent complex samples captured by `_collect_raw_bytes()`.
+        """
+        try:
+            if np is None:
+                return None
+            data = getattr(self, '_last_samples', None)
+            if data is None:
+                return None
+
+            # Take a short window for FFT (use min length)
+            x = data
+            n = len(x)
+            if n < 16:
+                return None
+
+            # Use a smaller FFT for speed
+            fft_n = 1 << (int(np.log2(n)) - 2) if n >= 64 else n
+            if fft_n < 16:
+                fft_n = n
+
+            # Use last fft_n samples
+            xw = x[-fft_n:]
+            # Window to reduce leakage
+            win = np.hanning(len(xw))
+            X = np.fft.fftshift(np.fft.fft(xw * win, n=fft_n))
+            ps = np.abs(X)
+            idx = int(np.argmax(ps))
+
+            # frequency axis (shifted)
+            freqs = np.fft.fftshift(np.fft.fftfreq(fft_n, d=1.0 / float(self.sample_rate)))
+            peak_rel = freqs[idx]
+
+            # absolute peak = center_freq + peak_rel
+            try:
+                cf = float(self.center_freq)
+                return cf + float(peak_rel)
+            except Exception:
+                return float(peak_rel)
+        except Exception:
+            return None
 
     def get_random_bytes(self, nbytes=32, max_cycles=16):
         """Return `nbytes` of whitened random data.

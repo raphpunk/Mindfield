@@ -2,6 +2,7 @@ import tkinter as tk
 from tkinter import messagebox, filedialog, ttk, simpledialog
 import tkinter.scrolledtext as scrolledtext
 import threading
+from collections import deque
 import os
 import asyncio
 import logging
@@ -16,11 +17,28 @@ import csv
 import json
 from hrv_manager import HRVDeviceManager
 from rng_collector import RNGCollector
-from sdr_rng import get_random_bytes
+from aqrng import get_random_bytes
 from group_session import GroupSessionManager
-from queue import Queue
+from queue import Queue, Empty
 import getpass
 import pathlib
+import tkinter.font as tkfont
+
+# Optional matplotlib for embedded realtime HRV plotting (best-effort)
+try:
+    import matplotlib
+    # prefer the TkAgg backend when available for embedding in Tkinter
+    try:
+        matplotlib.use('TkAgg')
+    except Exception:
+        pass
+    from matplotlib.figure import Figure
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+    _MPL_AVAILABLE = True
+except Exception:
+    Figure = None
+    FigureCanvasTkAgg = None
+    _MPL_AVAILABLE = False
 
 # Module-level logger
 logger = logging.getLogger('mindfield')
@@ -42,7 +60,12 @@ class ConsciousnessLab:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("mindfield-core")
-        self.root.geometry("650x650")
+        # Larger default size and enforce a reasonable minimum so controls are visible
+        self.root.geometry("900x700")
+        try:
+            self.root.minsize(800, 600)
+        except Exception:
+            pass
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
         
         # Core components
@@ -51,7 +74,28 @@ class ConsciousnessLab:
 #        self.hrv_manager = HRVDeviceManager()
         self.hrv_manager = HRVDeviceManager(self.coherence_queue)  
         self.rng_collector = RNGCollector()
+        # Start HRV -> RNG correlation consumer thread
+        try:
+            self._hrv_thread = threading.Thread(target=self._hrv_consumer, daemon=True)
+            self._hrv_thread.start()
+        except Exception:
+            self._hrv_thread = None
+        # Realtime HRV coherence history for sparkline
+        self._hrv_coherence_history = deque(maxlen=200)
+        self._hrv_sparkline_enabled = True
         self.group_manager = None
+        # SDR instance placeholder (created lazily by provider)
+        self._sdr_instance = None
+        # Measured peak smoothing and spectral-enable flag
+        self._sdr_measured_ema = None
+        self._sdr_ema_alpha = 0.25
+        self._sdr_spectral_enabled_var = tk.BooleanVar(value=True)
+        self._sdr_spectral_enabled = True
+        # SDR failure/backoff tracking for resilience
+        self._sdr_fail_count = 0
+        self._sdr_fail_threshold = 3
+        self._sdr_fail_backoff_secs = 300  # 5 minutes
+        self._sdr_disabled_until = 0
         
         # State
         self.device_vars = []
@@ -79,8 +123,19 @@ class ConsciousnessLab:
         self.bg_color = "#f7f9fb"
         self.panel_color = "#ffffff"
         self.accent_color = "#3498db"
-        self.title_font = ("Helvetica", 18, "bold")
-        self.header_font = ("Helvetica", 12, "bold")
+        # Create scalable named fonts so we can adjust sizes on window resize
+        try:
+            # Slightly smaller, tighter fonts for compact UI
+            self.title_font = tkfont.Font(family="Helvetica", size=16, weight="bold")
+            self.header_font = tkfont.Font(family="Helvetica", size=11, weight="bold")
+            self.stats_font = tkfont.Font(family="Helvetica", size=12)
+            self.small_font = tkfont.Font(family="Arial", size=9)
+        except Exception:
+            # fallback to tuples if tkfont not available
+            self.title_font = ("Helvetica", 18, "bold")
+            self.header_font = ("Helvetica", 12, "bold")
+            self.stats_font = ("Helvetica", 14)
+            self.small_font = ("Arial", 11)
         self.root.configure(bg=self.bg_color)
 
         # ttk style
@@ -89,7 +144,12 @@ class ConsciousnessLab:
             style.theme_use('clam')
         except Exception:
             pass
-        style.configure('Accent.TButton', background=self.accent_color, foreground='white', padding=6)
+        # Compact button styling
+        try:
+            style.configure('TButton', font=self.small_font, padding=3)
+        except Exception:
+            pass
+        style.configure('Accent.TButton', background=self.accent_color, foreground='white', padding=4)
 
         # Generate small circular icons for buttons (keeps references on self)
         self._icons = {}
@@ -113,7 +173,8 @@ class ConsciousnessLab:
                             pass
             return img
 
-        self._icons['scan'] = _make_icon('#3498db')
+        # make slightly smaller icons to match compact buttons
+        self._icons['scan'] = _make_icon('#3498db', size=14)
         self._icons['baseline'] = _make_icon('#9b59b6')
         self._icons['experiment'] = _make_icon('#27ae60')
         self._icons['seed'] = _make_icon('#8e44ad')
@@ -121,137 +182,344 @@ class ConsciousnessLab:
         self._icons['export'] = _make_icon('#34495e')
         self._icons['group'] = _make_icon('#f39c12')
 
-        # Title
-        tk.Label(self.root, text="Consciousness Field Lab",
-                 font=self.title_font, bg=self.bg_color, fg=self.accent_color).pack(pady=10)
+        # Body layout: left sidebar for controls, right content area for data panels
+        self.body_frame = tk.Frame(self.root, bg=self.bg_color)
+        self.body_frame.pack(side='top', fill='both', expand=True)
+
+        self.sidebar = tk.Frame(self.body_frame, bg=self.bg_color, padx=8, pady=8)
+        self.sidebar.pack(side='left', fill='y')
+
+        self.content_frame = tk.Frame(self.body_frame, bg=self.bg_color)
+        self.content_frame.pack(side='right', fill='both', expand=True)
+
+        # Create a scrollable main area inside the content frame for the data panels
+        self.main_container = tk.Frame(self.content_frame, bg=self.bg_color)
+        self.main_container.pack(fill='both', expand=True, padx=0, pady=0)
+
+
+        self._canvas = tk.Canvas(self.main_container, bg=self.bg_color, highlightthickness=0)
+        vsb = tk.Scrollbar(self.main_container, orient='vertical', command=self._canvas.yview)
+        self._canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side='right', fill='y')
+        self._canvas.pack(side='left', fill='both', expand=True)
+
+        self.main_inner = tk.Frame(self._canvas, bg=self.bg_color)
+        # keep the window id so we can update its width when the canvas resizes
+        self._inner_window = self._canvas.create_window((0, 0), window=self.main_inner, anchor='nw')
+
+        # Ensure the inner frame width matches the canvas width so widgets can use pack/grid naturally
+        def _on_canvas_config(event):
+            try:
+                self._canvas.itemconfig(self._inner_window, width=event.width)
+            except Exception:
+                pass
+
+        self._canvas.bind('<Configure>', _on_canvas_config)
+
+        def _on_frame_configure(event):
+            try:
+                bbox = self._canvas.bbox("all")
+                if bbox is None:
+                    # Nothing laid out yet; fall back to inner frame size
+                    w = self._canvas.winfo_width() or (event.width if hasattr(event, 'width') else 1)
+                    h = self.main_inner.winfo_height() or (event.height if hasattr(event, 'height') else 1)
+                    bbox = (0, 0, w, h)
+                else:
+                    # Ensure top is not negative which can cause unbounded scrolling
+                    x0, y0, x1, y1 = bbox
+                    if y0 < 0:
+                        y0 = 0
+                        bbox = (x0, y0, x1, y1)
+                self._canvas.configure(scrollregion=bbox)
+            except Exception:
+                pass
+
+        self.main_inner.bind("<Configure>", _on_frame_configure)
+
+        # Mouse wheel support (works on Windows/Mac/Linux with Button-4/5 fallback)
+        def _on_mousewheel(event):
+            try:
+                # X11 (Linux) uses Button-4/5 or event.num
+                if hasattr(event, 'num') and event.num in (4, 5):
+                    delta = 1 if event.num == 4 else -1
+                    self._canvas.yview_scroll(-delta, 'units')
+                else:
+                    # Windows/Mac: event.delta is multiples of 120 (may be positive or negative)
+                    try:
+                        # Normalize to sign-int
+                        d = int(event.delta / 120)
+                    except Exception:
+                        d = -1 if getattr(event, 'delta', 0) < 0 else 1
+                    if d == 0:
+                        d = -1 if getattr(event, 'delta', 0) < 0 else 1
+                    self._canvas.yview_scroll(-d, 'units')
+            except Exception:
+                pass
+
+        # Bind mousewheel only while pointer is over the canvas to avoid global scrolling
+        try:
+            # When the pointer enters the canvas, bind wheel events to the canvas widget
+            def _on_enter(_e):
+                try:
+                    self._canvas.bind('<MouseWheel>', _on_mousewheel)
+                    self._canvas.bind('<Button-4>', _on_mousewheel)
+                    self._canvas.bind('<Button-5>', _on_mousewheel)
+                except Exception:
+                    pass
+
+            def _on_leave(_e):
+                try:
+                    self._canvas.unbind('<MouseWheel>')
+                    self._canvas.unbind('<Button-4>')
+                    self._canvas.unbind('<Button-5>')
+                except Exception:
+                    pass
+
+            self._canvas.bind('<Enter>', _on_enter)
+            self._canvas.bind('<Leave>', _on_leave)
+            # Also bind once so clicks/focus still scroll if already over canvas
+            try:
+                self._canvas.bind('<MouseWheel>', _on_mousewheel)
+                self._canvas.bind('<Button-4>', _on_mousewheel)
+                self._canvas.bind('<Button-5>', _on_mousewheel)
+            except Exception:
+                pass
+        except Exception:
+            # Fallback: attach global handlers (last resort)
+            try:
+                self._canvas.bind_all('<MouseWheel>', _on_mousewheel)
+                self._canvas.bind_all('<Button-4>', _on_mousewheel)
+                self._canvas.bind_all('<Button-5>', _on_mousewheel)
+            except Exception:
+                pass
+
+        # Title (placed inside scrollable area)
+        tk.Label(self.main_inner, text="Consciousness Field Lab",
+             font=self.title_font, bg=self.bg_color, fg=self.accent_color)
+        # store title label ref for resizing
+        try:
+            self.title_label = self.main_inner.winfo_children()[-1]
+            self.title_label.pack(pady=10)
+        except Exception:
+            pass
         
         # HRV Section
-        hrv_frame = tk.LabelFrame(self.root, text="HRV Devices", padx=15, pady=10, bg=self.panel_color)
+        hrv_frame = tk.LabelFrame(self.main_inner, text="HRV Devices", padx=15, pady=10, bg=self.panel_color)
         hrv_frame.pack(fill="x", padx=20, pady=5)
         
         scan_btn = ttk.Button(hrv_frame, text="  Scan Devices", command=self.scan_devices, style='Accent.TButton', image=self._icons['scan'], compound=tk.LEFT)
-        scan_btn.config(width=15)
+        try:
+            scan_btn.config(width=12)
+        except Exception:
+            pass
         self.scan_btn = scan_btn
         scan_btn.pack(pady=5)
+
+        # Graph test button for generating synthetic HRV samples (for debugging/QA)
+        try:
+            self.hrv_graph_test_btn = ttk.Button(hrv_frame, text="Graph Test", command=self._toggle_hrv_graph_test)
+            self.hrv_graph_test_btn.pack(pady=4)
+        except Exception:
+            self.hrv_graph_test_btn = None
 
         # Tooltip helper (attached later)
         
         self.device_list = tk.Frame(hrv_frame)
         self.device_list.pack(fill="both", expand=True)
+
+        # HRV live stream display (recent samples)
+        try:
+            self.hrv_stream_box = scrolledtext.ScrolledText(hrv_frame, height=6, wrap=tk.WORD)
+            self.hrv_stream_box.pack(fill='both', expand=False, pady=(6,0))
+            self.hrv_stream_box.configure(state=tk.DISABLED)
+        except Exception:
+            self.hrv_stream_box = None
+        # HRV plot area: prefer Matplotlib if available, otherwise fallback to simple canvas
+        try:
+            plot_frame = tk.Frame(hrv_frame, bg=self.bg_color)
+            plot_frame.pack(fill='x', pady=(6,0))
+
+            self._hrv_plot_paused = False
+            self._hrv_history_len = 200
+
+            if _MPL_AVAILABLE and Figure is not None:
+                # Create a matplotlib Figure and embed it
+                try:
+                    fig = Figure(figsize=(6, 1.2), dpi=100)
+                    ax = fig.add_subplot(111)
+                    ax.set_ylim(0, 1)
+                    ax.set_xlim(0, self._hrv_history_len)
+                    ax.set_xlabel('Samples')
+                    ax.set_ylabel('Coherence')
+                    ax.grid(True, linestyle=':', linewidth=0.5)
+                    self._hrv_fig = fig
+                    self._hrv_ax = ax
+                    self._hrv_line, = ax.plot([], [], color='#2c3e50', linewidth=1.5)
+                    self._hrv_canvas = FigureCanvasTkAgg(fig, master=plot_frame)
+                    self._hrv_canvas_widget = self._hrv_canvas.get_tk_widget()
+                    self._hrv_canvas_widget.pack(side='left', fill='both', expand=True, padx=(0,6))
+                    # For sparkline compatibility use hrv_spark_canvas==None (matplotlib used)
+                    self.hrv_spark_canvas = None
+                except Exception:
+                    self._hrv_canvas = None
+                    self._hrv_canvas_widget = None
+                    self._hrv_fig = None
+                    self._hrv_ax = None
+                    self._hrv_line = None
+            else:
+                # Fallback simple canvas sparkline
+                try:
+                    self._hrv_canvas = None
+                    self._hrv_canvas_widget = tk.Canvas(plot_frame, height=60, bg='#ffffff', bd=1, relief=tk.SUNKEN)
+                    self._hrv_canvas_widget.pack(side='left', fill='x', expand=True, padx=(0,6))
+                    # Expose a common name used by sparkline drawing
+                    self.hrv_spark_canvas = self._hrv_canvas_widget
+                except Exception:
+                    self._hrv_canvas_widget = None
+
+            # Controls for the HRV plot
+            ctrl_frame = tk.Frame(plot_frame, bg=self.bg_color)
+            ctrl_frame.pack(side='right', fill='y')
+
+            self.hrv_pause_btn = ttk.Button(ctrl_frame, text='Pause', width=8, command=lambda: self._toggle_hrv_plot_pause())
+            self.hrv_pause_btn.pack(padx=4, pady=2)
+
+            tk.Label(ctrl_frame, text='History:').pack(padx=4)
+            self.hrv_history_scale = tk.Scale(ctrl_frame, from_=50, to=1000, orient='vertical', showvalue=True, resolution=10, command=lambda v: self._set_hrv_history(int(float(v))))
+            self.hrv_history_scale.set(self._hrv_history_len)
+            self.hrv_history_scale.pack(padx=4, pady=2)
+
+            self.hrv_export_csv_btn = ttk.Button(ctrl_frame, text='Export CSV', command=self._export_hrv_csv)
+            self.hrv_export_csv_btn.pack(padx=4, pady=(8,2))
+            self.hrv_export_png_btn = ttk.Button(ctrl_frame, text='Export PNG', command=self._export_hrv_png)
+            self.hrv_export_png_btn.pack(padx=4, pady=2)
+
+            # Label for latest coherence
+            self.hrv_spark_label = tk.Label(ctrl_frame, text='Coh: --', width=12, bg=self.bg_color)
+            self.hrv_spark_label.pack(padx=4, pady=(10,2))
+
+        except Exception:
+            self._hrv_canvas = None
+            self._hrv_canvas_widget = None
+            self._hrv_fig = None
+            self._hrv_ax = None
+            self._hrv_line = None
+            self.hrv_pause_btn = None
+            self.hrv_history_scale = None
+            self.hrv_export_csv_btn = None
+            self.hrv_export_png_btn = None
+            self.hrv_spark_label = None
+            self.hrv_spark_canvas = None
         
         # Stats Display
-        stats_frame = tk.LabelFrame(self.root, text="Live Statistics", padx=15, pady=10, bg=self.panel_color)
+        stats_frame = tk.LabelFrame(self.main_inner, text="Live Statistics", padx=15, pady=10, bg=self.panel_color)
         stats_frame.pack(fill="x", padx=20, pady=5)
         
         self.mode_label = tk.Label(stats_frame, text="Mode: IDLE",
-                     font=self.header_font, fg="#7f8c8d", bg=self.panel_color)
+                 font=self.header_font, fg="#7f8c8d", bg=self.panel_color)
         self.mode_label.pack()
         
         self.stats_label = tk.Label(stats_frame, text="Waiting to start...",
-                      font=("Helvetica", 14), bg=self.panel_color)
+                  font=self.stats_font, bg=self.panel_color)
         self.stats_label.pack(pady=5)
         
-        self.effect_label = tk.Label(stats_frame, text="", font=("Arial", 11))
+        self.effect_label = tk.Label(stats_frame, text="", font=self.small_font)
         self.effect_label.pack()
         
-        self.coherence_label = tk.Label(stats_frame, text="", font=("Arial", 11))
+        self.coherence_label = tk.Label(stats_frame, text="", font=self.small_font)
         self.coherence_label.pack()
         
         # Participant Display (for group sessions)
-        self.participant_frame = tk.LabelFrame(self.root, text="Active Participants", padx=15, pady=10, bg=self.panel_color)
+        self.participant_frame = tk.LabelFrame(self.main_inner, text="Active Participants", padx=15, pady=10, bg=self.panel_color)
         # Do not pack yet; will be shown after status bar is created to avoid ordering issues
         
         self.participant_labels = {}
         
-        # Control Panel (reorganized)
-        control_frame = tk.Frame(self.root, pady=10, bg=self.bg_color)
-        control_frame.pack(fill='x', padx=20)
+        # Session controls reside in the left sidebar so they remain visible without scrolling
+        session_frame = tk.LabelFrame(self.sidebar, text="Session Controls", padx=12, pady=10, bg=self.panel_color)
+        session_frame.pack(fill='x', pady=(0, 10))
 
-        left_controls = tk.Frame(control_frame, bg=self.bg_color)
-        left_controls.pack(side='left', anchor='w')
+        self.baseline_btn = ttk.Button(session_frame, text="Run Baseline", command=lambda: self.toggle_session("baseline"),
+                                       style='Accent.TButton', image=self._icons['baseline'], compound=tk.LEFT)
+        self.baseline_btn.pack(fill='x', pady=3)
 
-        self.baseline_btn = ttk.Button(left_controls, text="  Run Baseline",
-                 command=lambda: self.toggle_session("baseline"),
-                 style='Accent.TButton', image=self._icons['baseline'], compound=tk.LEFT)
-        self.baseline_btn.config(width=16)
-        self.baseline_btn.grid(row=0, column=0, padx=6)
-
-        self.experiment_btn = ttk.Button(left_controls, text="  Start Experiment",
-                   command=lambda: self.toggle_session("experiment"),
-                   style='Accent.TButton', image=self._icons['experiment'], compound=tk.LEFT)
-        self.experiment_btn.config(width=16)
-        self.experiment_btn.grid(row=0, column=1, padx=6)
+        self.experiment_btn = ttk.Button(session_frame, text="Start Experiment", command=lambda: self.toggle_session("experiment"),
+                                         style='Accent.TButton', image=self._icons['experiment'], compound=tk.LEFT)
+        self.experiment_btn.pack(fill='x', pady=3)
 
         # Session duration presets (minutes)
-        right_controls = tk.Frame(control_frame, bg=self.bg_color)
-        right_controls.pack(side='right', anchor='e')
-
-        tk.Label(right_controls, text="Duration:").grid(row=0, column=0, padx=(0,6))
+        duration_row = tk.Frame(session_frame, bg=self.panel_color)
+        duration_row.pack(fill='x', pady=(10, 4))
+        tk.Label(duration_row, text="Duration:", bg=self.panel_color).pack(side='left')
         self.duration_var = tk.StringVar(value="5")
-        presets = ["0.5","1","5","10","30","60"]
-        self.duration_menu = tk.OptionMenu(right_controls, self.duration_var, *presets)
+        presets = ["0.5", "1", "5", "10", "30", "60"]
+        self.duration_menu = tk.OptionMenu(duration_row, self.duration_var, *presets)
         self.duration_menu.config(width=6)
-        self.duration_menu.grid(row=0, column=1)
+        self.duration_menu.pack(side='left', padx=6)
 
-        self.countdown_label = tk.Label(right_controls, text="Time left: --:--", width=14)
-        self.countdown_label.grid(row=0, column=2, padx=(10,0))
-        # Subject info shown only to external admins
-        self.subject_info_label = tk.Label(right_controls, text="Subject: (none)", width=28, anchor='w', bg=self.bg_color)
-        self.subject_info_label.grid(row=1, column=0, columnspan=3, pady=(6,0))
-        
-        # Quick Actions
-        action_frame = tk.Frame(self.root, bg=self.bg_color)
-        action_frame.pack(pady=8)
-        
-        self.mark_btn = ttk.Button(action_frame, text="  Mark Intention", command=self.mark_intention, image=self._icons['group'], compound=tk.LEFT)
-        self.mark_btn.pack(side="left", padx=6)
+        self.countdown_label = tk.Label(session_frame, text="Time left: --:--", anchor='w', bg=self.panel_color)
+        self.countdown_label.pack(fill='x', pady=(6, 2))
+        self.subject_info_label = tk.Label(session_frame, text="Subject: (none)", anchor='w', bg=self.panel_color)
+        self.subject_info_label.pack(fill='x')
 
-        self.group_btn = ttk.Button(action_frame, text="  Group Session", command=self.start_group_session, image=self._icons['group'], compound=tk.LEFT)
-        self.group_btn.pack(side="left", padx=6)
+        # Quick Actions stacked vertically for accessibility
+        action_frame = tk.LabelFrame(self.sidebar, text="Quick Actions", padx=12, pady=10, bg=self.panel_color)
+        action_frame.pack(fill='x', pady=(0, 10))
+        self.action_frame = action_frame
 
-        self.export_btn = ttk.Button(action_frame, text="  Export Session", command=self.export_session, image=self._icons['export'], compound=tk.LEFT)
-        self.export_btn.pack(side="left", padx=6)
+        self.mark_btn = ttk.Button(action_frame, text="Mark Intention", command=self.mark_intention, image=self._icons['group'], compound=tk.LEFT)
+        self.mark_btn.pack(fill='x', pady=2)
 
-        self.toggle_bt_btn = ttk.Button(action_frame, text="  Toggle Bluetooth", command=self.toggle_bluetooth, image=self._icons['bt'], compound=tk.LEFT)
-        self.toggle_bt_btn.pack(side="left", padx=6)
+        self.group_btn = ttk.Button(action_frame, text="Group Session", command=self.start_group_session, image=self._icons['group'], compound=tk.LEFT)
+        self.group_btn.pack(fill='x', pady=2)
 
-        self.seed_btn = ttk.Button(action_frame, text="  Seed RNG (SDR)", command=self.seed_rng_from_sdr, image=self._icons['seed'], compound=tk.LEFT)
-        self.seed_btn.pack(side="left", padx=6)
+        self.toggle_bt_btn = ttk.Button(action_frame, text="Toggle Bluetooth", command=self.toggle_bluetooth, image=self._icons['bt'], compound=tk.LEFT)
+        self.toggle_bt_btn.pack(fill='x', pady=2)
 
-        # HRV stream test button
-        self.hrv_test_btn = ttk.Button(action_frame, text="  HRV Diagnostics", command=self.test_hrv_stream)
-        self.hrv_test_btn.pack(side="left", padx=6)
+        self.seed_btn = ttk.Button(action_frame, text="Seed RNG (SDR)", command=self.seed_rng_from_sdr, image=self._icons['seed'], compound=tk.LEFT)
+        self.seed_btn.pack(fill='x', pady=2)
 
-        # Bluetooth debug button
-        self.bt_debug_btn = ttk.Button(action_frame, text="  BT Debug", command=self.bt_debug)
-        self.bt_debug_btn.pack(side="left", padx=6)
-        # Admin mode quick buttons (visible to the operator)
-        admin_frame = tk.Frame(action_frame, bg=self.bg_color)
-        admin_frame.pack(side="left", padx=12)
+        self.sdr_stream_btn = ttk.Button(action_frame, text="Start SDR Stream", command=self.toggle_sdr_stream)
+        self.sdr_stream_btn.pack(fill='x', pady=2)
 
-        self.self_admin_btn = ttk.Button(admin_frame, text="Self-Admin", command=lambda: self.set_admin_mode('self'))
-        self.self_admin_btn.pack(side='left', padx=4)
+        try:
+            self.spectral_check = tk.Checkbutton(action_frame, text="Spectral", variable=self._sdr_spectral_enabled_var,
+                                                 command=lambda: self._on_spectral_toggle(), bg=self.panel_color)
+            self.spectral_check.pack(fill='x', pady=2)
+        except Exception:
+            self.spectral_check = None
 
-        self.external_admin_btn = ttk.Button(admin_frame, text="External Admin", command=lambda: self.set_admin_mode('external'))
-        self.external_admin_btn.pack(side='left', padx=4)
+        self.import_baseline_btn = ttk.Button(action_frame, text="Import Baseline", command=self.import_baseline)
+        self.import_baseline_btn.pack(fill='x', pady=(6, 2))
 
-        # One-click start test: switch to self-admin and start experiment
-        self.start_test_btn = ttk.Button(admin_frame, text="Start Test (Self-Admin)", command=self.start_test_self_admin)
-        self.start_test_btn.pack(side='left', padx=8)
+        self.compare_baseline_btn = ttk.Button(action_frame, text="Compare Baseline", command=self.compare_baseline)
+        self.compare_baseline_btn.pack(fill='x', pady=2)
 
-        # End test button
-        self.end_test_btn = ttk.Button(admin_frame, text="End Test", command=self.end_test)
-        self.end_test_btn.pack(side='left', padx=4)
+        ttk.Separator(action_frame, orient='horizontal').pack(fill='x', pady=(8, 6))
 
-        # apply accent style to important buttons
-        for b in (self.baseline_btn, self.experiment_btn, scan_btn):
-            try:
-                b.configure(style='Accent.TButton')
-            except Exception:
-                pass
+        self.self_admin_btn = ttk.Button(action_frame, text="Self-Admin", command=lambda: self.set_admin_mode('self'))
+        self.self_admin_btn.pack(fill='x', pady=2)
 
-        # Small status indicators
-        status_frame = tk.Frame(self.root, bg=self.bg_color)
+        self.external_admin_btn = ttk.Button(action_frame, text="External Admin", command=self.enter_external_admin)
+        self.external_admin_btn.pack(fill='x', pady=2)
+
+        self.start_test_btn = ttk.Button(action_frame, text="Start Test (Self-Admin)", command=self.start_test_self_admin)
+        self.start_test_btn.pack(fill='x', pady=2)
+
+        self.end_test_btn = ttk.Button(action_frame, text="End Test", command=self.end_test)
+        self.end_test_btn.pack(fill='x', pady=2)
+
+        self.bt_debug_btn = ttk.Button(action_frame, text="BT Debug", command=self.bt_debug)
+        self.bt_debug_btn.pack(fill='x', pady=(6, 2))
+
+        ttk.Separator(action_frame, orient='horizontal').pack(fill='x', pady=(8, 6))
+
+        # Provide quick access to export via sidebar
+        self.export_btn = ttk.Button(action_frame, text="Export Session", command=self.export_session)
+        self.export_btn.pack(fill='x', pady=2)
+
+        # Small status indicators (inside scrollable area)
+        status_frame = tk.Frame(self.main_inner, bg=self.bg_color)
         status_frame.pack(fill='x', padx=20, pady=(4,0))
 
         self.rng_led = tk.Label(status_frame, text=" RNG ", bg="#95a5a6", fg="white", relief=tk.RIDGE)
@@ -265,6 +533,9 @@ class ConsciousnessLab:
         self._set_led(self.rng_led, "off")
         self._set_led(self.bt_led, "off")
         self._set_led(self.sdr_led, "unknown")
+
+        # SDR stream state
+        self._sdr_streaming = False
 
         # Menu bar
         menubar = tk.Menu(self.root)
@@ -300,10 +571,18 @@ class ConsciousnessLab:
         except Exception:
             pass
 
-        # SDR status
+        # SDR status (kept outside the scrollable area so it's always visible)
         self.sdr_status_label = tk.Label(self.root, text="SDR: unknown", bd=1,
-                         relief=tk.GROOVE, anchor=tk.W, bg=self.bg_color)
+                 relief=tk.GROOVE, anchor=tk.W, bg=self.bg_color)
         self.sdr_status_label.pack(side=tk.BOTTOM, fill=tk.X)
+
+        # SDR current frequency / throughput display
+        self._sdr_last_freq = None
+        self._sdr_last_measured_freq = None
+        self._sdr_last_bits_count = 0
+        self.sdr_freq_label = tk.Label(self.root, text="SDR freq: --", bd=1,
+                   relief=tk.GROOVE, anchor=tk.W, bg=self.bg_color)
+        self.sdr_freq_label.pack(side=tk.BOTTOM, fill=tk.X)
 
         # Show onboarding on first run
         try:
@@ -322,6 +601,21 @@ class ConsciousnessLab:
         # Tooltips
         try:
             self._attach_tooltips()
+        except Exception:
+            pass
+        # Bind root resize to scale UI fonts/widgets (debounced)
+        try:
+            self._resize_after_id = None
+            self.root.bind('<Configure>', self._on_root_config)
+        except Exception:
+            pass
+        # Apply initial scaling and reflow immediately so layout is compact on startup
+        try:
+            self._apply_ui_scale()
+        except Exception:
+            pass
+        try:
+            self._reflow_action_buttons()
         except Exception:
             pass
         
@@ -575,6 +869,15 @@ class ConsciousnessLab:
             
     def toggle_session(self, mode):
         if not self.running:
+            # If starting an experiment and no baseline imported yet, prompt user to import
+            if mode == "experiment" and not self.rng_collector.baseline_bits:
+                try:
+                    want = messagebox.askyesno("Import Baseline", "No baseline data is currently imported. Import a baseline file now?")
+                    if want:
+                        # reuse existing import dialog
+                        self.import_baseline()
+                except Exception:
+                    pass
             # For individual sessions, connect selected devices
             if self.current_session_type == "individual":
                 selected = [addr for var, addr, _ in self.device_vars if var.get()]
@@ -640,15 +943,106 @@ class ConsciousnessLab:
         # Auto-save prompt
         if messagebox.askyesno("Save Data", "Save session data?"):
             self.export_session()
+
+        # After session ends, if a baseline exists, compute and show final comparison
+        try:
+            comp = self.rng_collector.get_baseline_comparison()
+            if comp:
+                txt = (f"Baseline mean: {comp['baseline_mean']:.6f}\n"
+                       f"Experiment mean: {comp['experiment_mean']:.6f}\n"
+                       f"Effect percent: {comp['effect_percent']:+.4f}%\n"
+                       f"Baseline bits: {comp['baseline_bits']}, Experiment bits: {comp['experiment_bits']}")
+                # Show summary and offer to save comparison
+                messagebox.showinfo('Final Comparison', txt)
+                try:
+                    save = messagebox.askyesno('Save Comparison', 'Save comparison results to file?')
+                except Exception:
+                    save = False
+                if save:
+                    path = filedialog.asksaveasfilename(defaultextension='.json', filetypes=[('JSON','*.json')], initialfile='comparison.json')
+                    if path:
+                        try:
+                            with open(path, 'w') as f:
+                                json.dump({'comparison': comp, 'timestamp': datetime.now().isoformat()}, f, indent=2)
+                            self._audit_event('save-comparison', {'path': path, 'comp': comp})
+                            messagebox.showinfo('Saved', f'Comparison saved to {path}')
+                        except Exception as e:
+                            messagebox.showwarning('Save failed', f'Could not save comparison: {e}')
+        except Exception:
+            pass
             
     def mark_intention(self):
         if not self.running or self.rng_collector.mode == "baseline":
             messagebox.showinfo("Info", "Run an experiment to mark intentions")
             return
-            
+        # Prompt user for the intent type
+        intent = self._prompt_intent()
+        if not intent:
+            # cancelled
+            return
+
         coherence_data = self.hrv_manager.get_all_coherence()
-        self.rng_collector.mark_event("intention", coherence_data)
-        self.status_bar.config(text=f"Marked intention at bit {self.rng_collector.get_stats()['count']}")
+        try:
+            self.rng_collector.mark_event("intention", coherence_data, meta={'intent': intent})
+        except TypeError:
+            # fallback if RNGCollector older signature
+            self.rng_collector.mark_event("intention", coherence_data)
+        self.status_bar.config(text=f"Marked intention '{intent}' at bit {self.rng_collector.get_stats()['count']}")
+
+    def _prompt_intent(self):
+        """Show a modal dialog to choose an intention label and return it (or None if cancelled)."""
+        intents = [
+            "Send Calm / Relaxation",
+            "Increase Focus / Attention",
+            "Increase Coherence / Synchrony",
+            "Lower Heart Rate / Relax",
+            "Send Healing / Wellbeing",
+            "Improve Sleep / Rest",
+            "Generate Random Intention",
+            "Other..."
+        ]
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Select Intention")
+        dlg.transient(self.root)
+        dlg.grab_set()
+        dlg.geometry("420x200")
+
+        tk.Label(dlg, text="Choose an intention to mark:", font=self.header_font).pack(pady=(12,6))
+
+        sel_var = tk.StringVar(value=intents[0])
+        opt = ttk.Combobox(dlg, values=intents, textvariable=sel_var, state='readonly')
+        opt.pack(fill='x', padx=20)
+
+        other_var = tk.StringVar()
+        other_entry = tk.Entry(dlg, textvariable=other_var)
+        other_entry.pack(fill='x', padx=20, pady=(6,0))
+        other_entry.insert(0, "(optional: type custom intent here)")
+
+        result = {'val': None}
+
+        def _on_ok():
+            choice = sel_var.get()
+            if choice == 'Other...':
+                val = other_var.get().strip()
+                if not val or val.startswith('('):
+                    messagebox.showwarning('Input required', 'Please enter a custom intent label.')
+                    return
+                result['val'] = val
+            else:
+                result['val'] = choice
+            dlg.destroy()
+
+        def _on_cancel():
+            dlg.destroy()
+
+        btnf = tk.Frame(dlg)
+        btnf.pack(fill='x', pady=12)
+        tk.Button(btnf, text='OK', command=_on_ok).pack(side='right', padx=12)
+        tk.Button(btnf, text='Cancel', command=_on_cancel).pack(side='right')
+
+        self.root.wait_window(dlg)
+        return result['val']
         
     def update_loop(self):
         if self.running:
@@ -715,7 +1109,89 @@ class ConsciousnessLab:
                     except Exception:
                         pass
                     
+        # Refresh SDR frequency/throughput display
+        try:
+            if getattr(self, '_sdr_streaming', False):
+                freq = getattr(self, '_sdr_last_freq', None)
+                if freq:
+                    try:
+                        mhz = float(freq) / 1e6
+                        freq_text = f"SDR center: {mhz:.3f} MHz"
+                    except Exception:
+                        freq_text = f"SDR center: {freq}"
+                else:
+                    freq_text = "SDR center: --"
+
+                try:
+                    now = time.time()
+                    last_t = getattr(self, '_sdr_throughput_last_time', None)
+                    last_count = getattr(self, '_sdr_last_bits_count', None)
+                    if last_t is None or last_count is None:
+                        self.sdr_freq_label.config(text=freq_text)
+                        # Initialize snapshots
+                        self._sdr_last_bits_count = len(self.rng_collector.bits)
+                        self._sdr_throughput_last_time = now
+                    else:
+                        delta_bits = max(0, len(self.rng_collector.bits) - last_count)
+                        delta_t = max(0.001, now - last_t)
+                        rate = delta_bits / delta_t
+                        # Prefer measured peak (smoothed) if available
+                        measured = getattr(self, '_sdr_last_measured_freq', None)
+                        if measured:
+                            # Exponential moving average for smoothing
+                            if self._sdr_measured_ema is None:
+                                self._sdr_measured_ema = float(measured)
+                            else:
+                                try:
+                                    self._sdr_measured_ema = (self._sdr_ema_alpha * float(measured) +
+                                                            (1.0 - self._sdr_ema_alpha) * float(self._sdr_measured_ema))
+                                except Exception:
+                                    pass
+                            try:
+                                display_mhz = float(self._sdr_measured_ema) / 1e6
+                                freq_label = f"SDR peak: {display_mhz:.3f} MHz"
+                            except Exception:
+                                freq_label = freq_text
+                            self.sdr_freq_label.config(text=f"{freq_label} | {rate:.1f} bits/s")
+                        else:
+                            self.sdr_freq_label.config(text=f"{freq_text} | {rate:.1f} bits/s")
+                        self._sdr_last_bits_count = len(self.rng_collector.bits)
+                        self._sdr_throughput_last_time = now
+                except Exception:
+                    try:
+                        self.sdr_freq_label.config(text=freq_text)
+                    except Exception:
+                        pass
+            else:
+                try:
+                    self.sdr_freq_label.config(text="SDR freq: --")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
         # Schedule next update
+        # Re-enable SDR UI after backoff expires
+        try:
+            if getattr(self, '_sdr_disabled_until', 0) and time.time() >= getattr(self, '_sdr_disabled_until', 0):
+                try:
+                    # Reset counters and re-enable button
+                    self._sdr_fail_count = 0
+                    self._sdr_disabled_until = 0
+                    try:
+                        self.sdr_stream_btn.config(text="  Start SDR Stream")
+                        try:
+                            self.sdr_stream_btn.state(['!disabled'])
+                        except Exception:
+                            self.sdr_stream_btn.config(state='normal')
+                    except Exception:
+                        pass
+                    self.status_bar.config(text="SDR controls re-enabled")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
         self.root.after(100, self.update_loop)
         
     def export_session(self):
@@ -751,7 +1227,8 @@ class ConsciousnessLab:
                 'comparison': comparison,
                 # Respect admin mode: if in self-admin, don't include raw bits or detailed markers
                 'markers': (self.rng_collector.markers if getattr(self, 'admin_mode', 'external') == 'external' else [{'count': len(self.rng_collector.markers)}]),
-                'raw_bits': (list(self.rng_collector.bits)[-10000:] if getattr(self, 'admin_mode', 'external') == 'external' else None)
+                'raw_bits': (list(self.rng_collector.bits)[-10000:] if getattr(self, 'admin_mode', 'external') == 'external' else None),
+                'hrv_snapshots': (list(self.rng_collector.hrv_snapshots) if getattr(self, 'admin_mode', 'external') == 'external' else None)
             }
             
             # Add group session data if applicable
@@ -797,6 +1274,16 @@ class ConsciousnessLab:
                             writer.writerow([m.get('timestamp'), m.get('event'), m.get('bit_index')])
                     else:
                         writer.writerow(['(redacted in self-admin mode)', '', ''])
+                # HRV snapshots
+                if getattr(self.rng_collector, 'hrv_snapshots', None):
+                    writer.writerow([])
+                    writer.writerow(['HRV Snapshots'])
+                    writer.writerow(['timestamp', 'device', 'heart_rate', 'coherence', 'bit_index', 'rr_intervals'])
+                    if getattr(self, 'admin_mode', 'external') == 'external':
+                        for s in self.rng_collector.hrv_snapshots:
+                            writer.writerow([s.get('timestamp'), s.get('device'), s.get('heart_rate'), s.get('coherence'), s.get('bit_index'), json.dumps(s.get('rr_intervals'))])
+                    else:
+                        writer.writerow(['(redacted in self-admin mode)'])
                         
         # Save group metadata if group session
         if self.current_session_type == "group" and self.group_manager:
@@ -1142,6 +1629,9 @@ class ConsciousnessLab:
                     messagebox.showwarning("Copy failed", str(e))
 
             tk.Button(btn_frame, text="Copy To Clipboard", command=_copy_all).pack(side='left', padx=6)
+            tk.Button(btn_frame, text="Apply Driver Fixes", command=lambda: threading.Thread(target=self.run_driver_fix, daemon=True).start()).pack(side='left', padx=6)
+            tk.Button(btn_frame, text="Run rtl_test (root)", command=lambda: threading.Thread(target=self.run_rtl_test_as_root, daemon=True).start()).pack(side='left', padx=6)
+            tk.Button(btn_frame, text="Undo Driver Fixes", command=lambda: threading.Thread(target=self.revert_driver_fix, daemon=True).start()).pack(side='left', padx=6)
             tk.Button(btn_frame, text="Close", command=dlg.destroy).pack(side='right', padx=6)
 
         except Exception as e:
@@ -1257,10 +1747,12 @@ class ConsciousnessLab:
             (self.baseline_btn, "Run a baseline session (no intentions)."),
             (self.experiment_btn, "Start an experiment session to record intentions."),
             (self.toggle_bt_btn, "Toggle system Bluetooth (BlueZ/rfkill fallback)."),
-            (self.hrv_test_btn, "Check selected HRV devices are sending heart-rate / RR data."),
             (self.bt_debug_btn, "Run quick bluetoothctl/rfkill diagnostics."),
-            (self.seed_btn, "Seed RNG from attached RTL-SDR device, or fall back to software RNG."),
+            (self.seed_btn, "Seed RNG from online quantum source (ANU QRNG) with SDR/software fallback."),
+            (self.import_baseline_btn, "Import a saved baseline dataset for comparison."),
+            (self.compare_baseline_btn, "Compare the current session against the imported baseline."),
             (self.export_btn, "Export current session data to CSV or JSON."),
+            # HRV diagnostics handled inside HRV panel (Graph Test)
             (self.scan_btn, "Scan for HRV BLE devices nearby."),
         ]
 
@@ -1269,6 +1761,282 @@ class ConsciousnessLab:
                 _ToolTip(w, t)
             except Exception:
                 pass
+
+        # Ensure action buttons are laid out to fit initial size
+        try:
+            self._reflow_action_buttons()
+        except Exception:
+            pass
+
+        # Reflow when the main inner frame changes size
+        try:
+            self.main_inner.bind('<Configure>', lambda e: self._reflow_action_buttons(e))
+        except Exception:
+            pass
+
+    def run_driver_fix(self):
+        """Unload DVB kernel modules and optionally install udev/blacklist rules.
+
+        This will request privilege escalation when needed via `_run_with_possible_privilege`.
+        It writes temporary files into the current working directory then moves them into place.
+        """
+        try:
+            ok = messagebox.askyesno('Driver Fix',
+                                     'This will unload kernel modules that may conflict with RTL-SDR and optionally install udev and modprobe blacklist files to make the change persistent.\n\nContinue?')
+            if not ok:
+                return
+
+            # Step 1: unload common conflicting modules
+            unload_cmd = ['modprobe', '-r', 'dvb_usb_rtl28xxu', 'rtl2832_sdr', 'r820t', 'rtl2832']
+            res = self._run_with_possible_privilege(unload_cmd, timeout=12)
+            out_text = ''
+            try:
+                out_text += f"Unload result: returncode={res.returncode}\n"
+                out_text += (getattr(res, 'stdout', '') or '') + '\n' + (getattr(res, 'stderr', '') or '')
+            except Exception:
+                out_text += 'Unload result: (no detailed output)\n'
+
+            # Ask whether to install udev rule
+            install_udev = messagebox.askyesno('Udev rule', 'Create a udev rule to grant device access to group "plugdev" (writes /etc/udev/rules.d/52-rtl-sdr.rules)?')
+            if install_udev:
+                udev_content = ('# RTL-SDR permissions for Realtek RTL2832U (vendor 0bda product 2838)\n'
+                                'ATTRS{idVendor}=="0bda", ATTRS{idProduct}=="2838", MODE="0664", GROUP="plugdev"\n')
+                tmp_path = os.path.join(os.getcwd(), '.tmp_52-rtl-sdr.rules')
+                try:
+                    with open(tmp_path, 'w') as f:
+                        f.write(udev_content)
+
+                    # Backup existing file if present
+                    target = '/etc/udev/rules.d/52-rtl-sdr.rules'
+                    try:
+                        stat_res = self._run_with_possible_privilege(['test', '-f', target], timeout=4)
+                        # If test returned 0, file exists -> create backup
+                        if getattr(stat_res, 'returncode', 1) == 0:
+                            bak = target + '.bak'
+                            self._run_with_possible_privilege(['cp', target, bak], timeout=6)
+                            # record backup for potential revert
+                            self._driver_fix_backups = getattr(self, '_driver_fix_backups', {})
+                            self._driver_fix_backups['udev'] = bak
+                    except Exception:
+                        pass
+
+                    mv_res = self._run_with_possible_privilege(['mv', tmp_path, target], timeout=8)
+                    out_text += '\nudev move: ' + str(getattr(mv_res, 'returncode', '')) + '\n'
+                except Exception as e:
+                    out_text += f'Failed to write/move udev rule: {e}\n'
+
+                # reload udev rules
+                try:
+                    reload_res = self._run_with_possible_privilege(['udevadm', 'control', '--reload'], timeout=6)
+                    trigger_res = self._run_with_possible_privilege(['udevadm', 'trigger'], timeout=6)
+                    out_text += f'udev reload return: {getattr(reload_res, "returncode", "")}, trigger: {getattr(trigger_res, "returncode", "")}\n'
+                except Exception as e:
+                    out_text += f'Failed to reload/trigger udev: {e}\n'
+
+            install_blacklist = messagebox.askyesno('Blacklist module', 'Write a modprobe blacklist file to prevent DVB driver loading automatically (writes /etc/modprobe.d/blacklist-rtl.conf)?')
+            if install_blacklist:
+                bl_content = ('# Prevent DVB kernel driver from binding to RTL2832U dongles (for rtl-sdr usage)\n'
+                              'blacklist dvb_usb_rtl28xxu\n'
+                              'blacklist rtl2832_sdr\n'
+                              'blacklist r820t\n')
+                tmpb = os.path.join(os.getcwd(), '.tmp_blacklist-rtl.conf')
+                try:
+                    with open(tmpb, 'w') as f:
+                        f.write(bl_content)
+                    mvb = self._run_with_possible_privilege(['mv', tmpb, '/etc/modprobe.d/blacklist-rtl.conf'], timeout=8)
+                    out_text += '\nblacklist move: ' + str(getattr(mvb, 'returncode', '')) + '\n'
+                except Exception as e:
+                    out_text += f'Failed to write/move blacklist file: {e}\n'
+
+            # Summarize and show results
+            def _show():
+                try:
+                    dlg = tk.Toplevel(self.root)
+                    dlg.title('Driver Fix Results')
+                    dlg.geometry('720x420')
+                    txt = scrolledtext.ScrolledText(dlg, wrap=tk.WORD)
+                    txt.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+                    txt.insert(tk.END, out_text)
+                    txt.configure(state=tk.DISABLED)
+                    tk.Button(dlg, text='Close', command=dlg.destroy).pack(pady=6)
+                except Exception:
+                    messagebox.showinfo('Driver Fix Results', out_text)
+
+            try:
+                self.root.after(0, _show)
+            except Exception:
+                messagebox.showinfo('Driver Fix Results', out_text)
+
+        except Exception as e:
+            logger.exception('Driver fix failed')
+            messagebox.showerror('Driver Fix', f'Error while applying driver fixes: {e}')
+
+    def run_rtl_test_as_root(self):
+        """Run `rtl_test -t` with privilege if needed and show the output in a dialog."""
+        out = ''
+        try:
+            res = self._run_with_possible_privilege(['rtl_test', '-t'], timeout=60)
+            try:
+                out = (getattr(res, 'stdout', '') or '') + '\n' + (getattr(res, 'stderr', '') or '')
+            except Exception:
+                out = str(res)
+        except Exception as e:
+            out = f'Error running rtl_test: {e}'
+
+        def _show():
+            try:
+                dlg = tk.Toplevel(self.root)
+                dlg.title('rtl_test output')
+                dlg.geometry('720x420')
+                txt = scrolledtext.ScrolledText(dlg, wrap=tk.WORD)
+                txt.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+                txt.insert(tk.END, out)
+                txt.configure(state=tk.DISABLED)
+                tk.Button(dlg, text='Close', command=dlg.destroy).pack(pady=6)
+            except Exception:
+                messagebox.showinfo('rtl_test', out)
+
+        try:
+            self.root.after(0, _show)
+        except Exception:
+            pass
+
+    def revert_driver_fix(self):
+        """Undo driver fix by restoring backups or removing added files.
+
+        Uses backups created during `run_driver_fix()` stored in `self._driver_fix_backups`.
+        """
+        try:
+            ok = messagebox.askyesno('Undo Driver Fixes', 'Attempt to restore previous udev/blacklist files and reload udev? Continue?')
+            if not ok:
+                return
+
+            out_text = ''
+            backups = getattr(self, '_driver_fix_backups', {}) or {}
+
+            # Restore udev rule
+            target = '/etc/udev/rules.d/52-rtl-sdr.rules'
+            if 'udev' in backups:
+                bak = backups['udev']
+                try:
+                    mv_res = self._run_with_possible_privilege(['mv', bak, target], timeout=8)
+                    out_text += f'Restored udev from {bak} -> {target}\n'
+                except Exception as e:
+                    out_text += f'Failed to restore udev backup: {e}\n'
+            else:
+                # No backup: remove the file we may have created
+                try:
+                    rm_res = self._run_with_possible_privilege(['rm', '-f', target], timeout=6)
+                    out_text += f'Removed udev rule {target}\n'
+                except Exception as e:
+                    out_text += f'Failed to remove udev rule: {e}\n'
+
+            # Restore blacklist
+            target_b = '/etc/modprobe.d/blacklist-rtl.conf'
+            if 'blacklist' in backups:
+                bakb = backups['blacklist']
+                try:
+                    mvb = self._run_with_possible_privilege(['mv', bakb, target_b], timeout=8)
+                    out_text += f'Restored blacklist from {bakb} -> {target_b}\n'
+                except Exception as e:
+                    out_text += f'Failed to restore blacklist backup: {e}\n'
+            else:
+                try:
+                    self._run_with_possible_privilege(['rm', '-f', target_b], timeout=6)
+                    out_text += f'Removed blacklist file {target_b}\n'
+                except Exception as e:
+                    out_text += f'Failed to remove blacklist file: {e}\n'
+
+            # Reload udev
+            try:
+                reload_res = self._run_with_possible_privilege(['udevadm', 'control', '--reload'], timeout=6)
+                trigger_res = self._run_with_possible_privilege(['udevadm', 'trigger'], timeout=6)
+                out_text += f'udev reload return: {getattr(reload_res, "returncode", "")}, trigger: {getattr(trigger_res, "returncode", "")}\n'
+            except Exception as e:
+                out_text += f'Failed to reload/trigger udev: {e}\n'
+
+            # Show results
+            def _show():
+                try:
+                    dlg = tk.Toplevel(self.root)
+                    dlg.title('Undo Driver Fix Results')
+                    dlg.geometry('720x420')
+                    txt = scrolledtext.ScrolledText(dlg, wrap=tk.WORD)
+                    txt.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+                    txt.insert(tk.END, out_text)
+                    txt.configure(state=tk.DISABLED)
+                    tk.Button(dlg, text='Close', command=dlg.destroy).pack(pady=6)
+                except Exception:
+                    messagebox.showinfo('Undo Driver Fix Results', out_text)
+
+            try:
+                self.root.after(0, _show)
+            except Exception:
+                messagebox.showinfo('Undo Driver Fix Results', out_text)
+
+        except Exception as e:
+            logger.exception('Revert driver fix failed')
+            messagebox.showerror('Undo Driver Fixes', f'Error while reverting driver fixes: {e}')
+
+    def _on_root_config(self, event=None):
+        """Debounced handler for root '<Configure>' events to update UI scaling."""
+        try:
+            if getattr(self, '_resize_after_id', None):
+                try:
+                    self.root.after_cancel(self._resize_after_id)
+                except Exception:
+                    pass
+            self._resize_after_id = self.root.after(120, lambda: self._apply_ui_scale())
+        except Exception:
+            pass
+
+    def _apply_ui_scale(self):
+        """Adjust named font sizes based on current window width for responsive scaling."""
+        try:
+            w = max(400, self.root.winfo_width() or 800)
+            # scale factor around 1000px baseline
+            scale = max(0.7, min(1.6, w / 1000.0))
+            # Apply sizes to named fonts
+            try:
+                if isinstance(self.title_font, tkfont.Font):
+                    self.title_font.configure(size=max(10, int(18 * scale)))
+                if isinstance(self.header_font, tkfont.Font):
+                    self.header_font.configure(size=max(8, int(12 * scale)))
+                if isinstance(self.stats_font, tkfont.Font):
+                    self.stats_font.configure(size=max(9, int(14 * scale)))
+                if isinstance(self.small_font, tkfont.Font):
+                    self.small_font.configure(size=max(8, int(11 * scale)))
+            except Exception:
+                pass
+            # Reflow action buttons to account for width changes
+            try:
+                self._reflow_action_buttons()
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _reflow_action_buttons(self, event=None):
+        """Reflow the action buttons into multiple rows based on available width.
+
+        This swaps children from packed layout into a grid arrangement to allow
+        wrapping when the window is narrow.
+        """
+        try:
+            frame = getattr(self, 'action_frame', None)
+            if frame is None:
+                return
+            for child in frame.winfo_children():
+                try:
+                    child.grid_forget()
+                except Exception:
+                    pass
+                try:
+                    child.pack_configure(fill='x')
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     def _get_bluetooth_state(self):
         """Return 'blocked' or 'unblocked' or None on error.
@@ -1617,18 +2385,18 @@ class ConsciousnessLab:
                 print(f'Failed to start toggle thread: {e}')
 
     def seed_rng_from_sdr(self):
-        """Collect entropy via SDR and seed the internal RNGCollector's DRBG.
+        """Collect entropy via atmospheric/quantum RNG (preferred) and seed the internal RNGCollector's DRBG.
 
-        Runs in background and falls back to software RNG if SDR isn't available.
+        Runs in background and falls back to SDR or software RNG if needed.
         """
         def worker():
-            self.status_bar.config(text="Seeding RNG from SDR...")
+            self.status_bar.config(text="Seeding RNG from Quantum RNG (online preferred)...")
             try:
                 # Detect SDR availability first
                 from sdr_rng import is_sdr_available
                 sdr_ok = is_sdr_available()
-                # Request 64 bytes of entropy (whitened inside sdr_rng)
-                seed = get_random_bytes(64, prefer_sdr=True)
+                # Request 64 bytes of entropy (aqrng prefers SDR first)
+                seed = get_random_bytes(64)
             except Exception as e:
                 seed = None
                 sdr_ok = False
@@ -1648,8 +2416,8 @@ class ConsciousnessLab:
                     self.status_bar.config(text="Seeding failed")
                     messagebox.showwarning("Seed failed", f"Could not seed RNG: {e}")
             else:
-                # Fallback: inform user that we used software RNG
-                sw = get_random_bytes(64, prefer_sdr=False)
+                # Fallback: get software RNG (aqrng already attempted SDR/online)
+                sw = get_random_bytes(64)
                 try:
                     self.rng_collector.seed_rng(sw)
                     self.status_bar.config(text="RNG seeded from software fallback")
@@ -1662,6 +2430,635 @@ class ConsciousnessLab:
                     messagebox.showerror("Seed error", f"Seeding failed: {e}")
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _hrv_consumer(self):
+        """Background consumer that reads HRV samples placed on `self.coherence_queue`
+        by `HRVDeviceManager` and records them into `rng_collector` for correlation
+        analysis (bit-index aligned snapshots).
+        """
+        try:
+            while True:
+                try:
+                    sample = self.coherence_queue.get(timeout=1.0)
+                except Empty:
+                    continue
+                try:
+                    # sample is expected to be a dict from HRVDeviceManager
+                    self.rng_collector.record_hrv_snapshot(sample)
+                    # Update UI stream (must run on main thread)
+                    try:
+                        if getattr(self, 'hrv_stream_box', None) is not None:
+                            self.root.after(0, lambda s=sample: self._append_hrv_stream(s))
+                    except Exception:
+                        pass
+                except Exception:
+                    logger.exception('Failed to record HRV snapshot')
+        except Exception:
+            logger.exception('HRV consumer exiting')
+
+    def _toggle_hrv_graph_test(self):
+        """Start/stop a synthetic HRV generator that pushes samples to the coherence queue."""
+        try:
+            running = getattr(self, '_hrv_test_running', False)
+            if running:
+                # stop
+                self._hrv_test_running = False
+                try:
+                    if getattr(self, 'hrv_graph_test_btn', None) is not None:
+                        self.hrv_graph_test_btn.config(text='Graph Test')
+                except Exception:
+                    pass
+                try:
+                    self.status_bar.config(text='HRV graph test stopped')
+                except Exception:
+                    pass
+                return
+
+            # start
+            self._hrv_test_running = True
+            self._hrv_test_thread = threading.Thread(target=self._hrv_graph_test_worker, daemon=True)
+            self._hrv_test_thread.start()
+            try:
+                if getattr(self, 'hrv_graph_test_btn', None) is not None:
+                    self.hrv_graph_test_btn.config(text='Stop Graph Test')
+            except Exception:
+                pass
+            try:
+                self.status_bar.config(text='HRV graph test running')
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _hrv_graph_test_worker(self):
+        """Worker that emits synthetic coherence values periodically to the coherence queue."""
+        try:
+            import random, math
+            start = time.time()
+            while getattr(self, '_hrv_test_running', False):
+                t = time.time() - start
+                # slow sinusoidal coherence between 0.1 and 0.9 with small noise
+                coh = 0.5 + 0.4 * math.sin(2 * math.pi * (t / 6.0)) + random.uniform(-0.05, 0.05)
+                coh = max(0.0, min(1.0, coh))
+                sample = {
+                    'timestamp': time.time(),
+                    'device': 'graph-test',
+                    'heart_rate': 60 + int(5 * math.sin(t)),
+                    'coherence': coh,
+                    'rr_intervals': []
+                }
+                try:
+                    self.coherence_queue.put(sample, block=False)
+                except Exception:
+                    try:
+                        self.coherence_queue.put(sample)
+                    except Exception:
+                        pass
+                time.sleep(0.5)
+        except Exception:
+            logger.exception('HRV graph test worker failed')
+        finally:
+            try:
+                self._hrv_test_running = False
+                if getattr(self, 'hrv_graph_test_btn', None) is not None:
+                    try:
+                        self.hrv_graph_test_btn.config(text='Graph Test')
+                    except Exception:
+                        pass
+                try:
+                    self.status_bar.config(text='HRV graph test stopped')
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+    def _append_hrv_stream(self, sample: dict):
+        """Append a formatted HRV sample to the on-screen stream box.
+
+        This runs on the main/UI thread.
+        """
+        try:
+            box = getattr(self, 'hrv_stream_box', None)
+            if box is None:
+                return
+            # Format a compact single-line summary
+            ts = datetime.fromtimestamp(sample.get('timestamp', time.time())).isoformat()
+            dev = sample.get('device', 'unknown')
+            hr = sample.get('heart_rate', 'n/a')
+            coh = sample.get('coherence', 0.0)
+            bi = sample.get('bit_index', None) or len(self.rng_collector.bits)
+            rr = sample.get('rr_intervals', [])
+            txt = f"{ts} | {dev} | HR={hr} | coh={coh:.3f} | bit_index={bi} | rr_count={len(rr)}\n"
+
+            # Insert and keep read-only
+            box.configure(state=tk.NORMAL)
+            box.insert(tk.END, txt)
+            # Trim to reasonable size (keep ~200 lines)
+            lines = int(box.index('end-1c').split('.')[0])
+            if lines > 250:
+                # delete oldest lines
+                box.delete('1.0', f'{lines-200}.0')
+            box.see(tk.END)
+            box.configure(state=tk.DISABLED)
+        except Exception:
+            pass
+        # Update sparkline history and redraw
+        try:
+            coh = float(sample.get('coherence', 0.0) or 0.0)
+            if self._hrv_sparkline_enabled:
+                self._hrv_coherence_history.append(coh)
+                try:
+                    if getattr(self, 'hrv_spark_canvas', None) is not None:
+                        self._draw_hrv_sparkline()
+                except Exception:
+                    pass
+            try:
+                if getattr(self, 'hrv_spark_label', None) is not None:
+                    self.hrv_spark_label.config(text=f"Coh: {coh:.3f}")
+            except Exception:
+                pass
+        except Exception:
+            pass
+        # If matplotlib figure is present, schedule an update of the embedded plot
+        try:
+            if getattr(self, '_hrv_fig', None) is not None and getattr(self, '_hrv_line', None) is not None:
+                try:
+                    # schedule on main thread
+                    self.root.after(0, self._update_hrv_plot)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _draw_hrv_sparkline(self):
+        """Draw the coherence sparkline onto the canvas. Assumes called on main thread."""
+        try:
+            canvas = getattr(self, 'hrv_spark_canvas', None)
+            if canvas is None:
+                return
+            data = list(self._hrv_coherence_history)
+            w = max(100, canvas.winfo_width() or 300)
+            h = max(20, canvas.winfo_height() or 60)
+            canvas.delete('all')
+            if not data:
+                # draw baseline
+                canvas.create_line(0, h/2, w, h/2, fill='#ddd')
+                return
+
+            # scale data 0..1 to canvas height (invert y)
+            mx = max(1.0, max(data))
+            mn = min(0.0, min(data))
+            span = mx - mn if (mx - mn) > 0 else 1.0
+            # pad left/right
+            left_pad = 4
+            right_pad = 4
+            usable_w = w - left_pad - right_pad
+            step = usable_w / max(1, (len(data)-1))
+            points = []
+            for i, v in enumerate(data):
+                x = left_pad + i * step
+                # normalize
+                nv = (v - mn) / span
+                y = h - (nv * (h - 6)) - 3
+                points.append((x, y))
+
+            # draw polyline
+            for i in range(len(points)-1):
+                x1,y1 = points[i]
+                x2,y2 = points[i+1]
+                canvas.create_line(x1,y1,x2,y2, fill='#2c3e50', width=2)
+
+            # draw latest point
+            lx,ly = points[-1]
+            canvas.create_oval(lx-3, ly-3, lx+3, ly+3, fill='#e67e22', outline='')
+        except Exception:
+            pass
+
+    # --- Matplotlib / HRV plot control helpers ---
+    def _toggle_hrv_plot_pause(self):
+        """Toggle pause/resume for the embedded HRV Matplotlib plot."""
+        try:
+            self._hrv_plot_paused = not getattr(self, '_hrv_plot_paused', False)
+            if getattr(self, 'hrv_pause_btn', None) is not None:
+                try:
+                    self.hrv_pause_btn.config(text='Resume' if self._hrv_plot_paused else 'Pause')
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _set_hrv_history(self, n: int):
+        """Adjust the history length for HRV coherence plotting."""
+        try:
+            n = max(10, int(n))
+            cur = getattr(self, '_hrv_coherence_history', None)
+            if cur is None:
+                self._hrv_coherence_history = deque(maxlen=n)
+            else:
+                # preserve existing data
+                data = list(cur)
+                self._hrv_coherence_history = deque(data[-n:], maxlen=n)
+            self._hrv_history_len = n
+            # update axes if using matplotlib
+            if getattr(self, '_hrv_ax', None) is not None:
+                try:
+                    self._hrv_ax.set_xlim(0, n)
+                    if getattr(self, '_hrv_canvas', None) is not None:
+                        try:
+                            self._hrv_canvas.draw_idle()
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _export_hrv_csv(self):
+        """Export recorded HRV snapshots to CSV."""
+        try:
+            if not getattr(self.rng_collector, 'hrv_snapshots', None):
+                messagebox.showinfo('Export HRV', 'No HRV snapshots to export')
+                return
+            path = filedialog.asksaveasfilename(defaultextension='.csv', filetypes=[('CSV','*.csv')], initialfile='hrv_snapshots.csv')
+            if not path:
+                return
+            with open(path, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(['timestamp', 'device', 'heart_rate', 'coherence', 'bit_index', 'rr_intervals'])
+                snapshots = list(self.rng_collector.hrv_snapshots)
+                if getattr(self, 'admin_mode', 'external') != 'external':
+                    # redacted in self-admin mode
+                    messagebox.showinfo('Export HRV', 'HRV snapshots are redacted in self-admin mode')
+                    return
+                for s in snapshots:
+                    writer.writerow([s.get('timestamp'), s.get('device'), s.get('heart_rate'), s.get('coherence'), s.get('bit_index'), json.dumps(s.get('rr_intervals'))])
+            messagebox.showinfo('Export HRV', f'HRV snapshots exported to {path}')
+        except Exception as e:
+            logger.exception('Export HRV CSV failed')
+            messagebox.showerror('Export HRV', f'Export failed: {e}')
+
+    def _export_hrv_png(self):
+        """Export the current HRV plot to PNG (if matplotlib available)."""
+        try:
+            if not getattr(self, '_hrv_fig', None):
+                messagebox.showinfo('Export PNG', 'Matplotlib not available or no figure to export')
+                return
+            path = filedialog.asksaveasfilename(defaultextension='.png', filetypes=[('PNG','*.png')], initialfile='hrv_plot.png')
+            if not path:
+                return
+            try:
+                self._hrv_fig.savefig(path, dpi=150)
+                messagebox.showinfo('Export PNG', f'HRV plot saved to {path}')
+            except Exception:
+                # fallback: try canvas print to postscript then convert (best-effort)
+                try:
+                    self._hrv_canvas.print_figure(path)
+                    messagebox.showinfo('Export PNG', f'HRV plot saved to {path}')
+                except Exception as e:
+                    logger.exception('Export HRV PNG failed')
+                    messagebox.showerror('Export PNG', f'Could not save PNG: {e}')
+        except Exception:
+            pass
+
+    def _update_hrv_plot(self):
+        """Update the embedded Matplotlib HRV line with data from the history deque."""
+        try:
+            if getattr(self, '_hrv_plot_paused', False):
+                return
+            if getattr(self, '_hrv_ax', None) is None or getattr(self, '_hrv_line', None) is None:
+                return
+            data = list(getattr(self, '_hrv_coherence_history', []))
+            if not data:
+                # clear line
+                try:
+                    self._hrv_line.set_data([], [])
+                    self._hrv_ax.set_xlim(0, self._hrv_history_len)
+                    self._hrv_ax.set_ylim(0, 1)
+                    if getattr(self, '_hrv_canvas', None) is not None:
+                        try:
+                            self._hrv_canvas.draw_idle()
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                return
+
+            x = list(range(max(0, len(data) - self._hrv_history_len), max(0, len(data) - self._hrv_history_len) + len(data)))
+            # ensure arrays same length
+            try:
+                self._hrv_line.set_data(range(len(data)), data)
+                self._hrv_ax.set_xlim(0, max(self._hrv_history_len, len(data)))
+                # auto-scale y in [0,1]
+                self._hrv_ax.set_ylim(0, 1)
+                if getattr(self, '_hrv_canvas', None) is not None:
+                    try:
+                        # prefer draw_idle if available, fallback to draw
+                        if hasattr(self._hrv_canvas, 'draw_idle'):
+                            self._hrv_canvas.draw_idle()
+                        else:
+                            try:
+                                self._hrv_canvas.draw()
+                            except Exception:
+                                # final fallback: call figure canvas draw via canvas manager
+                                try:
+                                    self._hrv_fig.canvas.draw()
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _sdr_provider_factory(self, chunk_bytes=1024, sdr_params=None):
+        """Return a callable that yields raw bytes for the SDR stream.
+
+        The callable will attempt to use `sdr_rng.SDRRNG` and fall back to
+        `aqrng.get_random_bytes` or `secrets.token_bytes` if SDR unavailable.
+        """
+        sdr_params = sdr_params or {}
+
+        def provider():
+            try:
+                from sdr_rng import SDRRNG
+                # instantiate per-call is expensive; instantiate once
+            except Exception:
+                SDRRNG = None
+
+            # Use a persistent instance stored on self to avoid repeated init
+            if getattr(self, '_sdr_instance', None) is None:
+                if SDRRNG is None:
+                    raise RuntimeError('SDR libraries not available (install pyrtlsdr + numpy)')
+
+                # Try a sequence of initialization parameter sets to help older
+                # R820T dongles that sometimes fail to lock at higher sample
+                # rates or with aggressive buffer sizes. Record attempts in
+                # the log and try progressively more conservative settings.
+                tried = []
+                param_sets = []
+                # Merge any user-provided sdr_params into trial sets
+                base = dict(sdr_params or {})
+                # Try preferred/default first
+                param_sets.append({**base})
+                # Lower sample rate and buffer sizes
+                param_sets.append({**base, 'sample_rate': 2.048e6, 'samples_per_hash': 16384})
+                # Try explicit maximum gain
+                param_sets.append({**base, 'sample_rate': 2.048e6, 'samples_per_hash': 8192, 'gain': 49.6})
+                # Try minimal gain
+                param_sets.append({**base, 'sample_rate': 1.024e6, 'samples_per_hash': 4096, 'gain': 0})
+
+                last_exc = None
+                for p in param_sets:
+                    try:
+                        logger.debug('Attempting SDR init with params: %s', p)
+                        self._sdr_instance = SDRRNG(**p)
+                        # success
+                        logger.info('SDR initialized with params: %s', p)
+                        break
+                    except Exception as exc:
+                        logger.warning('SDR init failed with params %s: %s', p, exc)
+                        tried.append((p, str(exc)))
+                        last_exc = exc
+                        self._sdr_instance = None
+
+                if self._sdr_instance is None:
+                    # Provide a helpful error including attempts
+                    msg = 'SDR initialization failed after尝试: ' + '; '.join([f"{t[0]} -> {t[1]}" for t in tried])
+                    logger.error(msg)
+                    raise RuntimeError(msg) from last_exc
+
+            try:
+                raw = self._sdr_instance._collect_raw_bytes()
+                # Update last-known center frequency for UI (Hz)
+                try:
+                    cf = getattr(self._sdr_instance, 'center_freq', None)
+                    if cf is not None:
+                        self._sdr_last_freq = float(cf)
+                except Exception:
+                    pass
+                # Attempt to compute measured peak frequency if supported
+                try:
+                    if getattr(self, '_sdr_spectral_enabled', True) and hasattr(self._sdr_instance, 'get_peak_frequency'):
+                        pf = self._sdr_instance.get_peak_frequency()
+                        if pf is not None:
+                            self._sdr_last_measured_freq = float(pf)
+                except Exception:
+                    pass
+                if not raw:
+                    raise RuntimeError('SDR returned no data')
+                return raw
+            except Exception as exc:
+                # Close the SDR so next attempt will re-open cleanly
+                try:
+                    if getattr(self, '_sdr_instance', None) is not None:
+                        close_fn = getattr(self._sdr_instance, 'close', None)
+                        if callable(close_fn):
+                            close_fn()
+                finally:
+                    self._sdr_instance = None
+                raise RuntimeError(f'SDR read failed: {exc}') from exc
+
+        return provider
+
+    def toggle_sdr_stream(self):
+        """Start/stop continuous SDR streaming into the RNGCollector."""
+        # Respect temporary disable/backoff window after repeated failures
+        now = time.time()
+        if getattr(self, '_sdr_disabled_until', 0) and now < getattr(self, '_sdr_disabled_until', 0):
+            rem = int(self._sdr_disabled_until - now)
+            messagebox.showwarning('SDR Disabled', f'SDR controls temporarily disabled due to repeated errors. Retry in {rem} seconds.')
+            return
+
+        if not getattr(self, '_sdr_streaming', False):
+            # Attempt to start; if provider init fails repeatedly, back off and disable SDR UI
+            try:
+                provider = self._sdr_provider_factory(1024)
+                self.rng_collector.start_sdr_stream(provider)
+                self._sdr_streaming = True
+                self.sdr_stream_btn.config(text="  Stop SDR Stream")
+                self.status_bar.config(text="SDR stream started")
+                self._set_led(self.sdr_led, 'on')
+                # initialize bits counter snapshot for throughput calc
+                try:
+                    self._sdr_last_bits_count = len(self.rng_collector.bits)
+                    self._sdr_throughput_last_time = time.time()
+                except Exception:
+                    self._sdr_last_bits_count = 0
+                    self._sdr_throughput_last_time = None
+                # reset failure count on success
+                self._sdr_fail_count = 0
+            except Exception as e:
+                logger.exception('Failed to start SDR stream')
+                # increment failure counter and possibly disable SDR controls
+                try:
+                    self._sdr_fail_count = getattr(self, '_sdr_fail_count', 0) + 1
+                except Exception:
+                    self._sdr_fail_count = 1
+
+                if self._sdr_fail_count >= getattr(self, '_sdr_fail_threshold', 3):
+                    # Apply backoff and disable UI controls
+                    self._sdr_disabled_until = time.time() + getattr(self, '_sdr_fail_backoff_secs', 300)
+                    try:
+                        self.sdr_stream_btn.config(text="SDR Disabled (errors)")
+                        try:
+                            self.sdr_stream_btn.state(['disabled'])
+                        except Exception:
+                            self.sdr_stream_btn.config(state='disabled')
+                    except Exception:
+                        pass
+                    msg = (f"SDR failed to start {self._sdr_fail_count} times.\n"
+                           "Controls have been disabled temporarily.\n"
+                           "Would you like to run a quick diagnostics (rtl_test -t)?")
+                    if messagebox.askyesno('SDR Error', msg):
+                        # Run diagnostics in background thread
+                        threading.Thread(target=self._run_sdr_diagnostics, daemon=True).start()
+                else:
+                    messagebox.showwarning('SDR Stream', f'Could not start SDR streaming: {e}\n(Attempt {self._sdr_fail_count}/{getattr(self, "_sdr_fail_threshold")})')
+        else:
+            try:
+                self.rng_collector.stop_sdr_stream()
+            except Exception:
+                pass
+            try:
+                if getattr(self, '_sdr_instance', None) is not None:
+                    close_fn = getattr(self._sdr_instance, 'close', None)
+                    if callable(close_fn):
+                        close_fn()
+            except Exception:
+                pass
+            finally:
+                self._sdr_instance = None
+            self._sdr_streaming = False
+            self.sdr_stream_btn.config(text="  Start SDR Stream")
+            self.status_bar.config(text="SDR stream stopped")
+            self._set_led(self.sdr_led, 'off')
+
+    def _run_sdr_diagnostics(self):
+        """Run `rtl_test -t` (best-effort) and show output in a dialog.
+
+        Runs in a background thread; uses `self.root.after` to display results.
+        """
+        out = ''
+        try:
+            # Try to run rtl_test; may not be present on all systems
+            proc = subprocess.run(['rtl_test', '-t'], capture_output=True, text=True, timeout=30)
+            out = (proc.stdout or '') + '\n' + (proc.stderr or '')
+        except FileNotFoundError:
+            out = 'rtl_test not found on this system. Install rtl-sdr package to run diagnostics.'
+        except subprocess.TimeoutExpired:
+            out = 'rtl_test timed out.'
+        except Exception as e:
+            out = f'Error running rtl_test: {e}'
+
+        def _show():
+            try:
+                dlg = tk.Toplevel(self.root)
+                dlg.title('SDR Diagnostics')
+                dlg.geometry('720x420')
+                txt = scrolledtext.ScrolledText(dlg, wrap=tk.WORD)
+                txt.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+                txt.insert(tk.END, out)
+                txt.configure(state=tk.DISABLED)
+                tk.Button(dlg, text='Close', command=dlg.destroy).pack(pady=6)
+            except Exception:
+                messagebox.showinfo('SDR Diagnostics', out)
+
+        try:
+            self.root.after(0, _show)
+        except Exception:
+            pass
+
+    def _on_spectral_toggle(self):
+        """Callback when spectral analysis checkbox is toggled."""
+        try:
+            self._sdr_spectral_enabled = bool(self._sdr_spectral_enabled_var.get())
+            self.status_bar.config(text=f"Spectral analysis {'enabled' if self._sdr_spectral_enabled else 'disabled'}")
+        except Exception:
+            pass
+
+    def import_baseline(self):
+        """Import baseline data from a file (JSON or CSV)."""
+        path = filedialog.askopenfilename(title='Select baseline file', filetypes=[('JSON','*.json'),('CSV','*.csv'),('All','*.*')])
+        if not path:
+            return
+        try:
+            bits = None
+            if path.endswith('.json'):
+                with open(path, 'r') as f:
+                    obj = json.load(f)
+                # Accept several formats: raw_bits list, baseline_bits list, hex string
+                if isinstance(obj, dict):
+                    if 'baseline_bits' in obj and isinstance(obj['baseline_bits'], list):
+                        bits = obj['baseline_bits']
+                    elif 'raw_bits' in obj and isinstance(obj['raw_bits'], list):
+                        bits = obj['raw_bits']
+                    elif 'seed' in obj and isinstance(obj['seed'], str):
+                        # hex seed -> unpack
+                        try:
+                            b = bytes.fromhex(obj['seed'])
+                            bits = []
+                            for byte in b:
+                                for i in range(8):
+                                    bits.append((byte >> i) & 1)
+                        except Exception:
+                            bits = None
+                elif isinstance(obj, list) and all(isinstance(x, int) for x in obj):
+                    bits = obj
+            else:
+                # Try CSV, assume a column of 0/1 or hex
+                bits = []
+                with open(path, 'r') as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        # Accept lines with digits separated by commas
+                        parts = [p.strip() for p in line.split(',') if p.strip()]
+                        for p in parts:
+                            if p in ('0','1'):
+                                bits.append(int(p))
+                            else:
+                                # try parse hex
+                                try:
+                                    b = bytes.fromhex(p)
+                                    for byte in b:
+                                        for i in range(8):
+                                            bits.append((byte >> i) & 1)
+                                except Exception:
+                                    continue
+
+            if bits is None:
+                messagebox.showwarning('Import Baseline', 'Could not parse baseline file')
+                return
+
+            ok = self.rng_collector.import_baseline_bits(bits)
+            if ok:
+                messagebox.showinfo('Import Baseline', f'Imported {len(self.rng_collector.baseline_bits)} baseline bits')
+                self._audit_event('import-baseline', {'path': path, 'count': len(self.rng_collector.baseline_bits)})
+            else:
+                messagebox.showwarning('Import Baseline', 'Failed to import baseline bits')
+        except Exception as e:
+            logger.exception('Import baseline failed')
+            messagebox.showerror('Import Baseline', f'Error importing baseline: {e}')
+
+    def compare_baseline(self):
+        """Compare currently imported baseline to current session using existing API."""
+        try:
+            comp = self.rng_collector.get_baseline_comparison()
+            if comp is None:
+                messagebox.showinfo('Compare Baseline', 'Not enough data to compare (need at least 100 bits in each)')
+                return
+            txt = (f"Baseline mean: {comp['baseline_mean']:.6f}\n"
+                   f"Experiment mean: {comp['experiment_mean']:.6f}\n"
+                   f"Effect percent: {comp['effect_percent']:+.4f}%\n"
+                   f"Baseline bits: {comp['baseline_bits']}, Experiment bits: {comp['experiment_bits']}")
+            messagebox.showinfo('Baseline Comparison', txt)
+            self._audit_event('compare-baseline', comp)
+        except Exception as e:
+            logger.exception('Baseline compare failed')
+            messagebox.showerror('Compare Baseline', f'Error comparing baseline: {e}')
+
         
     def on_closing(self):
         if self.running:

@@ -9,9 +9,13 @@ class RNGCollector:
     def __init__(self):
         self.bits = deque(maxlen=100000)
         self.baseline_bits = deque(maxlen=100000)
+        # Store HRV snapshots tied to bit indices for correlation analysis
+        self.hrv_snapshots = deque(maxlen=100000)
         self.running = False
         self.markers = []
         self.thread = None
+        self._sdr_stream_thread = None
+        self._sdr_streaming = False
         self.mode = "experiment"  # "experiment" or "baseline"
         self._lock = threading.Lock()
         self._drbg = None
@@ -42,13 +46,39 @@ class RNGCollector:
                 self.bits.append(bit)
             time.sleep(0.01)
     
-    def mark_event(self, event_type, coherence_data=None):
-        self.markers.append({
+    def mark_event(self, event_type, coherence_data=None, meta=None):
+        """Record a marker event with optional metadata.
+
+        meta: optional dict with extra information (e.g., {'intent': 'Calm'}).
+        """
+        entry = {
             'timestamp': time.time(),
             'bit_index': len(self.bits),
             'event': event_type,
             'coherence': coherence_data
-        })
+        }
+        if meta is not None:
+            entry['meta'] = meta
+        self.markers.append(entry)
+
+    def record_hrv_snapshot(self, hrv_sample: dict):
+        """Record an HRV sample alongside the current bit index for later correlation.
+
+        hrv_sample is expected to be the dict produced by HRVDeviceManager._parse_hr_data,
+        containing at least 'timestamp', 'device', 'heart_rate', 'rr_intervals', 'coherence'.
+        We augment it with the current bit_index for correlation analysis.
+        """
+        try:
+            if not isinstance(hrv_sample, dict):
+                return False
+            entry = dict(hrv_sample)
+            entry.setdefault('timestamp', time.time())
+            # Attach the bit index at the time this sample was observed
+            entry['bit_index'] = len(self.bits)
+            self.hrv_snapshots.append(entry)
+            return True
+        except Exception:
+            return False
     
     def get_stats(self, window=1000):
         if self.mode == "baseline":
@@ -153,3 +183,90 @@ class RNGCollector:
             except Exception:
                 # If DRBG instantiation fails, leave _drbg as None
                 self._drbg = None
+
+    # --- SDR streaming support ---
+    def start_sdr_stream(self, sdr_provider, sample_to_bits_fn=None):
+        """Start a background thread that continuously consumes raw SDR blocks
+        from `sdr_provider` and pushes bits into the collector.
+
+        - `sdr_provider` should be a callable that returns bytes (raw whitened
+          or raw sample bytes) each call, or an object with `get_random_bytes(n)`
+          method.
+        - `sample_to_bits_fn` optional function(bytes)->iterable_of_bits. If not
+          provided, bytes will be unpacked by their bit values (MSB-first).
+        """
+        if self._sdr_streaming:
+            return
+
+        def _default_unpack(bts):
+            for byte in bts:
+                for i in range(8):
+                    # yield LSB first for compactness
+                    yield (byte >> i) & 1
+
+        unpack = sample_to_bits_fn or _default_unpack
+
+        def _worker():
+            self._sdr_streaming = True
+            try:
+                while self._sdr_streaming:
+                    try:
+                        # prefer provider.get_random_bytes if present
+                        if callable(sdr_provider):
+                            raw = sdr_provider()
+                        else:
+                            raw = sdr_provider.get_random_bytes(1024)
+                        if not raw:
+                            # brief sleep to avoid busy loop on intermittent failures
+                            time.sleep(0.2)
+                            continue
+
+                        with self._lock:
+                            for bit in unpack(raw):
+                                if self.mode == "baseline":
+                                    self.baseline_bits.append(bit)
+                                else:
+                                    self.bits.append(bit)
+                        # small throttle to allow UI responsiveness
+                        time.sleep(0.01)
+                    except Exception:
+                        # On SDR errors, pause briefly and continue
+                        time.sleep(0.5)
+            finally:
+                self._sdr_streaming = False
+
+        self._sdr_stream_thread = threading.Thread(target=_worker, daemon=True)
+        self._sdr_stream_thread.start()
+
+    def stop_sdr_stream(self):
+        """Stop the background SDR streaming thread if running."""
+        try:
+            self._sdr_streaming = False
+            if self._sdr_stream_thread is not None:
+                self._sdr_stream_thread.join(timeout=1)
+        except Exception:
+            pass
+
+    def import_baseline_bits(self, bits_iterable):
+        """Import baseline bits from an iterable of 0/1 values (or bytes).
+
+        Accepts lists of ints, or bytes (will unpack to bits MSB-first).
+        """
+        try:
+            # If bytes-like provided, unpack to bits
+            if isinstance(bits_iterable, (bytes, bytearray)):
+                for byte in bits_iterable:
+                    for i in range(8):
+                        self.baseline_bits.append((byte >> i) & 1)
+                return True
+
+            # Iterable of ints
+            for v in bits_iterable:
+                if v in (0, 1):
+                    self.baseline_bits.append(int(v))
+                else:
+                    # ignore invalid values
+                    continue
+            return True
+        except Exception:
+            return False
