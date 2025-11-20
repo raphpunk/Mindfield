@@ -199,6 +199,16 @@ class ConsciousnessLab:
         self.seed_btn = ttk.Button(action_frame, text="  Seed RNG (SDR)", command=self.seed_rng_from_sdr, image=self._icons['seed'], compound=tk.LEFT)
         self.seed_btn.pack(side="left", padx=6)
 
+        # Admin mode quick buttons (visible to the operator)
+        admin_frame = tk.Frame(action_frame, bg=self.bg_color)
+        admin_frame.pack(side="left", padx=12)
+
+        self.self_admin_btn = ttk.Button(admin_frame, text="Self-Admin", command=lambda: self.set_admin_mode('self'))
+        self.self_admin_btn.pack(side='left', padx=4)
+
+        self.external_admin_btn = ttk.Button(admin_frame, text="External Admin", command=lambda: self.set_admin_mode('external'))
+        self.external_admin_btn.pack(side='left', padx=4)
+
         # apply accent style to important buttons
         for b in (self.baseline_btn, self.experiment_btn, scan_btn):
             try:
@@ -717,6 +727,28 @@ class ConsciousnessLab:
                     pass
         except Exception as e:
             messagebox.showerror("Error", f"Could not set admin mode: {e}")
+        finally:
+            try:
+                self._update_admin_buttons()
+            except Exception:
+                pass
+
+    def _update_admin_buttons(self):
+        """Update the admin mode buttons' labels to reflect current selection."""
+        try:
+            mode = getattr(self, 'admin_mode', 'external')
+            if getattr(self, 'self_admin_btn', None) is not None:
+                if mode == 'self':
+                    self.self_admin_btn.config(text="Self-Admin ✓")
+                else:
+                    self.self_admin_btn.config(text="Self-Admin")
+            if getattr(self, 'external_admin_btn', None) is not None:
+                if mode == 'external':
+                    self.external_admin_btn.config(text="External Admin ✓")
+                else:
+                    self.external_admin_btn.config(text="External Admin")
+        except Exception:
+            pass
 
     def show_troubleshooting(self):
         """Open a small dialog showing polkit and udev guidance for Bluetooth and SDR access."""

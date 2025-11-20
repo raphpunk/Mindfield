@@ -4,15 +4,7 @@
 
 A real-time consciousness field detection system that correlates heart rhythm coherence across multiple participants with quantum random number generation anomalies.
 
-Screenshots
------------
-
-Below are two quick screenshots of the GUI (v0.2.0 UI polish + onboarding):
-
-![mindfield preview 1](screenshots/mindfield_preview.png)
-
-![mindfield preview 2](screenshots/mindfield_preview2.png)
-- **Coherence Detection**: Automatic intention marking at high coherence thresholds
+**Coherence Detection**: Automatic intention marking at high coherence thresholds
 - **Baseline Comparison**: Run baseline sessions to compare against intention experiments
 - **Session Recording**: Export all data to CSV for further analysis
 
