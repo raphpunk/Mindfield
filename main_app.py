@@ -41,6 +41,17 @@ class ConsciousnessLab:
         self.current_session_type = "individual"
         
         self.setup_gui()
+        # Honor environment override for admin mode on startup for testing
+        try:
+            env_mode = os.environ.get('MINDFIELD_ADMIN_MODE')
+            if env_mode:
+                try:
+                    self.set_admin_mode(env_mode)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
         self.update_loop()
         
 
