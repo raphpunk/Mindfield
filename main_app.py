@@ -18,6 +18,8 @@ from rng_collector import RNGCollector
 from sdr_rng import get_random_bytes
 from group_session import GroupSessionManager
 from queue import Queue
+import getpass
+import pathlib
 
 class ConsciousnessLab:
     def __init__(self):
@@ -198,7 +200,6 @@ class ConsciousnessLab:
 
         self.seed_btn = ttk.Button(action_frame, text="  Seed RNG (SDR)", command=self.seed_rng_from_sdr, image=self._icons['seed'], compound=tk.LEFT)
         self.seed_btn.pack(side="left", padx=6)
-
         # Admin mode quick buttons (visible to the operator)
         admin_frame = tk.Frame(action_frame, bg=self.bg_color)
         admin_frame.pack(side="left", padx=12)
@@ -208,6 +209,10 @@ class ConsciousnessLab:
 
         self.external_admin_btn = ttk.Button(admin_frame, text="External Admin", command=lambda: self.set_admin_mode('external'))
         self.external_admin_btn.pack(side='left', padx=4)
+
+        # One-click start test: switch to self-admin and start experiment
+        self.start_test_btn = ttk.Button(admin_frame, text="Start Test (Self-Admin)", command=self.start_test_self_admin)
+        self.start_test_btn.pack(side='left', padx=8)
 
         # apply accent style to important buttons
         for b in (self.baseline_btn, self.experiment_btn, scan_btn):
@@ -595,7 +600,12 @@ class ConsciousnessLab:
         # Save group metadata if group session
         if self.current_session_type == "group" and self.group_manager:
             self.group_manager.save_session_metadata(filepath)
-            
+        # Audit export action
+        try:
+            who = getpass.getuser()
+            self._audit_event('export-session', {'user': who, 'filepath': filepath, 'mode': getattr(self, 'admin_mode', 'external')})
+        except Exception:
+            pass
         messagebox.showinfo("Exported", f"Session data saved to {filepath}")
         
     def show_error(self, message):
@@ -636,6 +646,13 @@ class ConsciousnessLab:
             # Update title/status to show current mode
             self.root.title(f"mindfield-core [{'Self-Admin' if mode=='self' else 'External Admin'}]")
             self.status_bar.config(text=f"Mode: {'Self-Admin (limited view)' if mode=='self' else 'External Admin (full view)'}")
+
+            # Audit the admin switch
+            try:
+                who = getpass.getuser()
+                self._audit_event('admin-switch', {'mode': mode, 'user': who})
+            except Exception:
+                pass
 
             # When in self-admin, minimize UI to timer-only view
             if mode == 'self':
@@ -749,6 +766,44 @@ class ConsciousnessLab:
                     self.external_admin_btn.config(text="External Admin")
         except Exception:
             pass
+
+    def _audit_event(self, event_type: str, details: dict):
+        """Append an audit event to `audit.log` in the repo root.
+
+        event_type: short string
+        details: mapping
+        """
+        try:
+            root = pathlib.Path(__file__).resolve().parent
+            logp = root / 'audit.log'
+            ts = datetime.utcnow().isoformat() + 'Z'
+            who = details.get('user') or getpass.getuser()
+            entry = {'timestamp': ts, 'event': event_type, 'user': who, 'details': details}
+            with open(logp, 'a') as f:
+                f.write(json.dumps(entry) + "\n")
+        except Exception:
+            pass
+
+    def start_test_self_admin(self):
+        """One-click flow: switch to Self-Admin, start an experiment session, and audit the action."""
+        try:
+            # Switch to self-admin UI
+            self.set_admin_mode('self')
+
+            # Start an experiment session if not running
+            if not self.running:
+                # For individual mode, ensure selected devices are connected as usual
+                # toggle_session will set up times and start RNG collection
+                self.toggle_session('experiment')
+
+            # Audit
+            try:
+                who = getpass.getuser()
+                self._audit_event('start-test-self-admin', {'user': who})
+            except Exception:
+                pass
+        except Exception as e:
+            messagebox.showerror('Error', f'Could not start test: {e}')
 
     def show_troubleshooting(self):
         """Open a small dialog showing polkit and udev guidance for Bluetooth and SDR access."""
