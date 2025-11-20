@@ -159,9 +159,7 @@ class ConsciousnessLab:
         
         # Participant Display (for group sessions)
         self.participant_frame = tk.LabelFrame(self.root, text="Active Participants", padx=15, pady=10, bg=self.panel_color)
-        # Show participant frame (placeholder until group session starts)
-        self.participant_frame.pack(fill="x", padx=20, pady=5, before=self.status_bar)
-        tk.Label(self.participant_frame, text="No participants", fg="#95a5a6", bg=self.panel_color).pack()
+        # Do not pack yet; will be shown after status bar is created to avoid ordering issues
         
         self.participant_labels = {}
         
@@ -292,6 +290,15 @@ class ConsciousnessLab:
         self.status_bar = tk.Label(self.root, text="Ready", bd=1, 
                                  relief=tk.SUNKEN, anchor=tk.W)
         self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+
+        # Ensure participant frame is visible (placeholder) and placed before status bar
+        try:
+            if not self.participant_frame.winfo_ismapped():
+                self.participant_frame.pack(fill="x", padx=20, pady=5, before=self.status_bar)
+            if not self.participant_frame.winfo_children():
+                tk.Label(self.participant_frame, text="No participants", fg="#95a5a6", bg=self.panel_color).pack()
+        except Exception:
+            pass
 
         # SDR status
         self.sdr_status_label = tk.Label(self.root, text="SDR: unknown", bd=1,
