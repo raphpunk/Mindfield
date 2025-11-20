@@ -4,6 +4,7 @@ import tkinter.scrolledtext as scrolledtext
 import threading
 import os
 import asyncio
+import logging
 from datetime import datetime
 import time
 import subprocess
@@ -20,6 +21,22 @@ from group_session import GroupSessionManager
 from queue import Queue
 import getpass
 import pathlib
+
+# Module-level logger
+logger = logging.getLogger('mindfield')
+if not logger.handlers:
+    logger.setLevel(logging.DEBUG)
+    try:
+        root = pathlib.Path(__file__).resolve().parent
+        logpath = root / 'mindfield.log'
+        fh = logging.FileHandler(logpath, encoding='utf-8')
+        fh.setLevel(logging.DEBUG)
+        fmt = logging.Formatter('%(asctime)s %(levelname)s %(name)s: %(message)s')
+        fh.setFormatter(fmt)
+        logger.addHandler(fh)
+    except Exception:
+        # fallback to basic config
+        logging.basicConfig(level=logging.DEBUG)
 
 class ConsciousnessLab:
     def __init__(self):
@@ -142,7 +159,9 @@ class ConsciousnessLab:
         
         # Participant Display (for group sessions)
         self.participant_frame = tk.LabelFrame(self.root, text="Active Participants", padx=15, pady=10, bg=self.panel_color)
-        # Don't pack initially
+        # Show participant frame (placeholder until group session starts)
+        self.participant_frame.pack(fill="x", padx=20, pady=5, before=self.status_bar)
+        tk.Label(self.participant_frame, text="No participants", fg="#95a5a6", bg=self.panel_color).pack()
         
         self.participant_labels = {}
         
@@ -200,6 +219,14 @@ class ConsciousnessLab:
 
         self.seed_btn = ttk.Button(action_frame, text="  Seed RNG (SDR)", command=self.seed_rng_from_sdr, image=self._icons['seed'], compound=tk.LEFT)
         self.seed_btn.pack(side="left", padx=6)
+
+        # HRV stream test button
+        self.hrv_test_btn = ttk.Button(action_frame, text="  HRV Diagnostics", command=self.test_hrv_stream)
+        self.hrv_test_btn.pack(side="left", padx=6)
+
+        # Bluetooth debug button
+        self.bt_debug_btn = ttk.Button(action_frame, text="  BT Debug", command=self.bt_debug)
+        self.bt_debug_btn.pack(side="left", padx=6)
         # Admin mode quick buttons (visible to the operator)
         admin_frame = tk.Frame(action_frame, bg=self.bg_color)
         admin_frame.pack(side="left", padx=12)
@@ -213,6 +240,10 @@ class ConsciousnessLab:
         # One-click start test: switch to self-admin and start experiment
         self.start_test_btn = ttk.Button(admin_frame, text="Start Test (Self-Admin)", command=self.start_test_self_admin)
         self.start_test_btn.pack(side='left', padx=8)
+
+        # End test button
+        self.end_test_btn = ttk.Button(admin_frame, text="End Test", command=self.end_test)
+        self.end_test_btn.pack(side='left', padx=4)
 
         # apply accent style to important buttons
         for b in (self.baseline_btn, self.experiment_btn, scan_btn):
@@ -349,6 +380,169 @@ class ConsciousnessLab:
                 pass
 
             self.toggle_session("experiment")
+
+    def test_hrv_stream(self):
+        """Check if selected HRV devices are transmitting RR/HR data.
+
+        Connects to selected devices (if not already connected), waits up to
+        `timeout` seconds for incoming data, and shows a summary dialog.
+        """
+        selected = [addr for var, addr, _ in self.device_vars if var.get()]
+        if not selected:
+            messagebox.showinfo("No Devices", "Select HRV devices first")
+            return
+
+        def worker():
+            self.root.after(0, lambda: self.status_bar.config(text="Testing HRV streams..."))
+            logger.info('HRV stream test started for: %s', selected)
+
+            # Ensure devices are being monitored
+            try:
+                self.hrv_manager.connect_devices(selected)
+            except Exception:
+                logger.exception('Failed to start HRV connect')
+
+            found = {}
+            timeout = 12
+            start = time.time()
+            while time.time() - start < timeout:
+                try:
+                    data = self.hrv_manager.get_all_coherence()
+                    for entry in data:
+                        addr = entry.get('device')
+                        if addr in selected:
+                            # record latest sample
+                            found.setdefault(addr, []).append(entry)
+                    if found:
+                        break
+                except Exception:
+                    logger.exception('Error reading HRV coherence')
+                time.sleep(1)
+
+            # Prepare result text
+            if not found:
+                txt = "No HRV data received within timeout. Ensure devices are connected and transmitting."
+                logger.warning('HRV test: no data for %s', selected)
+            else:
+                lines = []
+                for addr, samples in found.items():
+                    s = samples[-1]
+                    hr = s.get('heart_rate', '(n/a)')
+                    coh = s.get('coherence', 0)
+                    lines.append(f"{addr}: HR={hr} bpm, coherence={coh:.3f}, samples={len(samples)}")
+                txt = "\n".join(lines)
+                logger.info('HRV test results: %s', txt)
+
+            def _show():
+                try:
+                    self.status_bar.config(text="HRV test complete")
+                    dlg = tk.Toplevel(self.root)
+                    dlg.title("HRV Stream Test Results")
+                    dlg.geometry("540x240")
+                    st = scrolledtext.ScrolledText(dlg, wrap=tk.WORD)
+                    st.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+                    st.insert(tk.END, txt + "\n\nRaw samples (latest per device):\n")
+                    for addr, samples in found.items():
+                        st.insert(tk.END, f"--- {addr} ({len(samples)} samples) ---\n")
+                        for s in samples[-5:]:
+                            st.insert(tk.END, json.dumps(s) + "\n")
+                    st.configure(state=tk.DISABLED)
+                    tk.Button(dlg, text="Close", command=dlg.destroy).pack(pady=6)
+                except Exception:
+                    messagebox.showinfo("HRV Test", txt)
+
+            self.root.after(0, _show)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def bt_debug(self):
+        """Run bluetooth diagnostics (bluetoothctl show, rfkill list) with timeouts and show results."""
+        def worker():
+            self.root.after(0, lambda: self.status_bar.config(text="Running BT diagnostics..."))
+            out_lines = []
+            # If dbus/BlueZ available, try to list adapters and powered state
+            if dbus is not None:
+                try:
+                    try:
+                        system_bus = dbus.SystemBus()
+                    except Exception:
+                        system_bus = None
+                    if system_bus is not None:
+                        try:
+                            manager = dbus.Interface(
+                                system_bus.get_object('org.bluez', '/'),
+                                'org.freedesktop.DBus.ObjectManager'
+                            )
+                            objs = manager.GetManagedObjects()
+                            adapter_info = []
+                            for path, interfaces in objs.items():
+                                if 'org.bluez.Adapter1' in interfaces:
+                                    props = interfaces.get('org.bluez.Adapter1', {})
+                                    powered = props.get('Powered')
+                                    name = props.get('Alias') or props.get('Address') or path
+                                    adapter_info.append(f"{path}: powered={powered}, alias={name}")
+                            if adapter_info:
+                                out_lines.append(('bluez dbus adapters', '\n'.join(adapter_info)))
+                        except Exception:
+                            logger.exception('Error reading BlueZ adapters via dbus')
+                except Exception:
+                    logger.exception('BlueZ dbus diagnostic failed')
+            try:
+                # bluetoothctl show
+                try:
+                    res = subprocess.run(["bluetoothctl", "show"], capture_output=True, text=True, timeout=5)
+                    out_lines.append(('bluetoothctl show', res.stdout or res.stderr))
+                    logger.debug('bluetoothctl show: %s', res.stdout)
+                except subprocess.TimeoutExpired:
+                    out_lines.append(('bluetoothctl show', 'TIMED OUT'))
+                    logger.warning('bluetoothctl show timed out')
+                except FileNotFoundError:
+                    out_lines.append(('bluetoothctl show', 'NOT FOUND'))
+                    logger.debug('bluetoothctl not installed')
+
+                # rfkill list bluetooth
+                try:
+                    res = subprocess.run(["rfkill", "list", "bluetooth"], capture_output=True, text=True, timeout=5)
+                    out_lines.append(('rfkill list bluetooth', res.stdout or res.stderr))
+                    logger.debug('rfkill output: %s', res.stdout)
+                except subprocess.TimeoutExpired:
+                    out_lines.append(('rfkill list bluetooth', 'TIMED OUT'))
+                    logger.warning('rfkill list bluetooth timed out')
+                except FileNotFoundError:
+                    out_lines.append(('rfkill list bluetooth', 'NOT FOUND'))
+                    logger.debug('rfkill not installed')
+
+            except Exception:
+                logger.exception('BT debug failed')
+
+            # Add verify_connectivity summary
+            try:
+                v = self.verify_connectivity(do_ble_scan=False)
+                summary = []
+                for k in ('bluez', 'bluetoothctl', 'rfkill', 'ble_scan'):
+                    summary.append(f"{k}: {v.get(k)}")
+                out_lines.append(('connectivity summary', '\n'.join(summary)))
+            except Exception:
+                logger.exception('Failed to append connectivity summary')
+
+            def _show():
+                try:
+                    dlg = tk.Toplevel(self.root)
+                    dlg.title('BT Diagnostics')
+                    dlg.geometry('700x420')
+                    txt = scrolledtext.ScrolledText(dlg, wrap=tk.WORD)
+                    txt.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+                    for title, content in out_lines:
+                        txt.insert(tk.END, f"=== {title} ===\n")
+                        txt.insert(tk.END, (content or '').strip() + "\n\n")
+                    txt.configure(state=tk.DISABLED)
+                    tk.Button(dlg, text='Close', command=dlg.destroy).pack(pady=6)
+                except Exception:
+                    messagebox.showinfo('BT Diagnostics', '\n'.join([f"{t}: {c}" for t, c in out_lines]))
+
+            self.root.after(0, _show)
+
+        threading.Thread(target=worker, daemon=True).start()
             
     def setup_participant_display(self, participants):
         # Show participant frame
@@ -627,6 +821,87 @@ class ConsciousnessLab:
         except Exception:
             pass
 
+    def _run_with_possible_privilege(self, cmd, timeout=None):
+        """Run `cmd` (a list) and if it fails due to permission, ask the user
+        on the main thread to authorize and re-run via `pkexec` (or `sudo` fallback).
+
+        This helper may block the calling thread while waiting for the main
+        thread to perform the privileged call; it's safe to call from a
+        background worker.
+        Returns a subprocess.CompletedProcess-like object.
+        """
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        except Exception as e:
+            # Could not run even the non-privileged command
+            logger.exception('Failed to run command: %s', cmd)
+            try:
+                return subprocess.CompletedProcess(cmd, 1, stdout="", stderr=str(e))
+            except Exception:
+                return None
+
+        # If command succeeded, return
+        if res.returncode == 0:
+            logger.debug('Command succeeded: %s', cmd)
+            return res
+
+        out = (res.stderr or "") + (res.stdout or "")
+        low = out.lower()
+
+        # Heuristic: permission errors include 'permission', 'denied', 'not authorized'
+        if any(x in low for x in ("permission", "denied", "not authorized", "authorization")):
+            q = Queue()
+            logger.debug('Permission-like error detected for cmd %s: %s', cmd, out)
+
+            def _ask_and_run():
+                try:
+                    proceed = messagebox.askyesno("Authorization required",
+                                                   f"Administrator privileges are required to run:\n{' '.join(cmd)}\n\nAllow? ")
+                except Exception:
+                    proceed = False
+
+                if not proceed:
+                    logger.info('User denied privilege elevation for: %s', cmd)
+                    q.put(subprocess.CompletedProcess(cmd, 126, stdout="", stderr="user denied"))
+                    return
+
+                # Try pkexec first
+                try:
+                    pcmd = ['pkexec'] + cmd
+                    logger.debug('Attempting pkexec for: %s', cmd)
+                    r2 = subprocess.run(pcmd, capture_output=True, text=True, timeout=timeout)
+                    logger.debug('pkexec result: %s', getattr(r2, 'returncode', None))
+                    q.put(r2)
+                    return
+                except FileNotFoundError:
+                    logger.debug('pkexec not found; will try sudo')
+                except Exception as e:
+                    logger.exception('pkexec execution failed')
+                    # Put the error result and continue to sudo fallback
+                    q.put(subprocess.CompletedProcess(cmd, 1, stdout="", stderr=str(e)))
+                    return
+
+                # Fallback to sudo
+                try:
+                    scmd = ['sudo'] + cmd
+                    logger.debug('Attempting sudo for: %s', cmd)
+                    r3 = subprocess.run(scmd, capture_output=True, text=True, timeout=timeout)
+                    logger.debug('sudo result: %s', getattr(r3, 'returncode', None))
+                    q.put(r3)
+                    return
+                except Exception as e:
+                    logger.exception('sudo execution failed')
+                    q.put(subprocess.CompletedProcess(cmd, 1, stdout="", stderr=str(e)))
+
+            # Schedule the authorization on the main thread so messagebox and polkit dialogs can appear
+            try:
+                self.root.after(0, _ask_and_run)
+                return q.get()
+            except Exception as e:
+                return subprocess.CompletedProcess(cmd, 1, stdout="", stderr=str(e))
+
+        return res
+
     def enter_external_admin(self):
         """Enter External Admin mode (no password required)."""
         try:
@@ -670,27 +945,10 @@ class ConsciousnessLab:
                                     btn.config(state='disabled')
                                 except Exception:
                                     pass
-
-                    # Hide stats and participant displays
+                    # For Self-Admin, disable controls but keep layout stable and visible
+                    # This avoids layout shifts on small screens and keeps status context
                     try:
-                        self.stats_label.pack_forget()
-                    except Exception:
-                        pass
-                    try:
-                        self.effect_label.pack_forget()
-                    except Exception:
-                        pass
-                    try:
-                        self.coherence_label.pack_forget()
-                    except Exception:
-                        pass
-                    try:
-                        self.participant_frame.pack_forget()
-                    except Exception:
-                        pass
-
-                    # Clear subject info (don't show subject to test-taker)
-                    try:
+                        # Mark subject info as hidden, but keep the widget in place
                         self.subject_info_label.config(text="Subject: (hidden)")
                     except Exception:
                         pass
@@ -779,8 +1037,21 @@ class ConsciousnessLab:
             ts = datetime.utcnow().isoformat() + 'Z'
             who = details.get('user') or getpass.getuser()
             entry = {'timestamp': ts, 'event': event_type, 'user': who, 'details': details}
-            with open(logp, 'a') as f:
-                f.write(json.dumps(entry) + "\n")
+
+            # Ensure the audit log exists and has restrictive permissions (owner read/write only).
+            # Write the entry, then attempt to chmod to 0o600 to limit access.
+            try:
+                # Open with append mode; create if needed
+                with open(logp, 'a') as f:
+                    f.write(json.dumps(entry) + "\n")
+                try:
+                    # Set restrictive permissions; ignore if not permitted
+                    os.chmod(logp, 0o600)
+                except Exception:
+                    pass
+            except Exception:
+                # If writing/appending failed, ignore silently to avoid blocking UI
+                pass
         except Exception:
             pass
 
@@ -804,6 +1075,22 @@ class ConsciousnessLab:
                 pass
         except Exception as e:
             messagebox.showerror('Error', f'Could not start test: {e}')
+
+    def end_test(self):
+        """End the current test/session if running. Audits the action."""
+        try:
+            if self.running:
+                self.stop_session()
+                try:
+                    who = getpass.getuser()
+                    self._audit_event('end-test', {'user': who})
+                except Exception:
+                    pass
+                messagebox.showinfo('Test Ended', 'The current test has been stopped.')
+            else:
+                messagebox.showinfo('No Test', 'No test is currently running.')
+        except Exception as e:
+            messagebox.showerror('Error', f'Could not end test: {e}')
 
     def show_troubleshooting(self):
         """Open a small dialog showing polkit and udev guidance for Bluetooth and SDR access."""
@@ -887,10 +1174,25 @@ class ConsciousnessLab:
                     except Exception:
                         s = False
 
-                    bt = self._get_bluetooth_state()
+                    # Use the new verify_connectivity helper for a more complete check
+                    try:
+                        bt_stats = self.verify_connectivity(do_ble_scan=False)
+                    except Exception:
+                        bt_stats = {'bluez': None, 'bluetoothctl': None, 'rfkill': None, 'ble_scan': None, 'ok': False}
 
                     self._onboard_sdr_label.config(text=f"SDR: {'available' if s else 'not available'}")
-                    self._onboard_bt_label.config(text=f"Bluetooth: {bt if bt else 'unknown'}")
+                    # Prefer BlueZ result if present
+                    bt_text = bt_stats.get('bluez') or bt_stats.get('bluetoothctl') or bt_stats.get('rfkill')
+                    if bt_text is True:
+                        bt_text = 'unblocked'
+                    if bt_text is False:
+                        bt_text = 'blocked'
+                    self._onboard_bt_label.config(text=f"Bluetooth: {bt_text if bt_text else 'unknown'}")
+                    # Update BT LED
+                    try:
+                        self._set_led(self.bt_led, 'on' if bt_stats.get('ok') else 'off')
+                    except Exception:
+                        pass
 
                 threading.Thread(target=_worker, daemon=True).start()
 
@@ -948,6 +1250,8 @@ class ConsciousnessLab:
             (self.baseline_btn, "Run a baseline session (no intentions)."),
             (self.experiment_btn, "Start an experiment session to record intentions."),
             (self.toggle_bt_btn, "Toggle system Bluetooth (BlueZ/rfkill fallback)."),
+            (self.hrv_test_btn, "Check selected HRV devices are sending heart-rate / RR data."),
+            (self.bt_debug_btn, "Run quick bluetoothctl/rfkill diagnostics."),
             (self.seed_btn, "Seed RNG from attached RTL-SDR device, or fall back to software RNG."),
             (self.export_btn, "Export current session data to CSV or JSON."),
             (self.scan_btn, "Scan for HRV BLE devices nearby."),
@@ -960,17 +1264,173 @@ class ConsciousnessLab:
                 pass
 
     def _get_bluetooth_state(self):
-        """Return 'blocked' or 'unblocked' or None on error."""
+        """Return 'blocked' or 'unblocked' or None on error.
+
+        Tries multiple methods (rfkill then bluetoothctl) to determine state.
+        """
         try:
-            res = subprocess.run(["rfkill", "list", "bluetooth"], capture_output=True, text=True)
-            out = res.stdout.lower() + res.stderr.lower()
-            if "soft blocked: yes" in out or "blocked: yes" in out:
-                return "blocked"
-            if "soft blocked: no" in out or "blocked: no" in out:
-                return "unblocked"
+            # Prefer BlueZ DBus if available — more reliable than `rfkill`/`bluetoothctl` parsing
+            if dbus is not None:
+                try:
+                    try:
+                        system_bus = dbus.SystemBus()
+                    except Exception:
+                        system_bus = None
+                    if system_bus is not None:
+                        manager = dbus.Interface(
+                            system_bus.get_object('org.bluez', '/'),
+                            'org.freedesktop.DBus.ObjectManager'
+                        )
+                        objs = manager.GetManagedObjects()
+                        for path, interfaces in objs.items():
+                            if 'org.bluez.Adapter1' in interfaces:
+                                props = interfaces['org.bluez.Adapter1']
+                                # `Powered` property may be a boolean-like
+                                powered = props.get('Powered')
+                                if powered is True or str(powered).lower() == 'true':
+                                    return 'unblocked'
+                                if powered is False or str(powered).lower() == 'false':
+                                    return 'blocked'
+                except Exception:
+                    logger.exception('DBus check for Bluetooth state failed')
+
+            # Try rfkill first (common on many distros)
+            try:
+                try:
+                    res = subprocess.run(["rfkill", "list", "bluetooth"], capture_output=True, text=True, timeout=5)
+                except subprocess.TimeoutExpired:
+                    logger.warning('rfkill list bluetooth timed out')
+                    res = None
+                if res:
+                    out = (res.stdout or "") + (res.stderr or "")
+                    out = out.lower()
+                    if "soft blocked: yes" in out or "blocked: yes" in out:
+                        return "blocked"
+                    if "soft blocked: no" in out or "blocked: no" in out:
+                        return "unblocked"
+            except FileNotFoundError:
+                # rfkill not available; fall through
+                pass
+
+            # Fall back to bluetoothctl show (looks for Powered: yes/no)
+            try:
+                try:
+                    res = subprocess.run(["bluetoothctl", "show"], capture_output=True, text=True, timeout=5)
+                except subprocess.TimeoutExpired:
+                    logger.warning('bluetoothctl show timed out')
+                    res = None
+                if res:
+                    out = (res.stdout or "") + (res.stderr or "")
+                    out = out.lower()
+                    if "powered: yes" in out:
+                        return "unblocked"
+                    if "powered: no" in out:
+                        return "blocked"
+            except FileNotFoundError:
+                pass
+
             return None
         except Exception:
             return None
+
+    def verify_connectivity(self, do_ble_scan: bool = False, ble_timeout: int = 5):
+        """Verify Bluetooth connectivity using multiple methods.
+
+        Returns a dict with keys: 'bluez', 'bluetoothctl', 'rfkill', 'ble_scan', 'ok'
+        - 'bluez': 'unblocked'|'blocked'|None
+        - 'bluetoothctl': same as above or raw output
+        - 'rfkill': 'unblocked'|'blocked'|None
+        - 'ble_scan': integer count of found advertising devices or None
+        - 'ok': boolean true if any positive indication of Bluetooth availability
+        """
+        results = {'bluez': None, 'bluetoothctl': None, 'rfkill': None, 'ble_scan': None, 'ok': False}
+
+        # Check BlueZ via DBus
+        if dbus is not None:
+            try:
+                try:
+                    system_bus = dbus.SystemBus()
+                except Exception:
+                    system_bus = None
+                if system_bus is not None:
+                    manager = dbus.Interface(
+                        system_bus.get_object('org.bluez', '/'),
+                        'org.freedesktop.DBus.ObjectManager'
+                    )
+                    objs = manager.GetManagedObjects()
+                    for path, interfaces in objs.items():
+                        if 'org.bluez.Adapter1' in interfaces:
+                            props = interfaces['org.bluez.Adapter1']
+                            powered = props.get('Powered')
+                            if powered is True or str(powered).lower() == 'true':
+                                results['bluez'] = 'unblocked'
+                                results['ok'] = True
+                                break
+                            if powered is False or str(powered).lower() == 'false':
+                                results['bluez'] = 'blocked'
+            except Exception:
+                logger.exception('verify_connectivity: BlueZ dbus check failed')
+
+        # rfkill
+        try:
+            res = subprocess.run(["rfkill", "list", "bluetooth"], capture_output=True, text=True, timeout=4)
+            out = (res.stdout or "") + (res.stderr or "")
+            low = out.lower()
+            if "soft blocked: yes" in low or "blocked: yes" in low:
+                results['rfkill'] = 'blocked'
+            elif "soft blocked: no" in low or "blocked: no" in low:
+                results['rfkill'] = 'unblocked'
+                results['ok'] = True
+            else:
+                results['rfkill'] = None
+        except subprocess.TimeoutExpired:
+            logger.warning('verify_connectivity: rfkill timed out')
+        except FileNotFoundError:
+            results['rfkill'] = None
+        except Exception:
+            logger.exception('verify_connectivity: rfkill check failed')
+
+        # bluetoothctl
+        try:
+            res = subprocess.run(["bluetoothctl", "show"], capture_output=True, text=True, timeout=4)
+            out = (res.stdout or "") + (res.stderr or "")
+            low = out.lower()
+            if "powered: yes" in low:
+                results['bluetoothctl'] = 'unblocked'
+                results['ok'] = True
+            elif "powered: no" in low:
+                results['bluetoothctl'] = 'blocked'
+            else:
+                results['bluetoothctl'] = out.strip()
+        except subprocess.TimeoutExpired:
+            logger.warning('verify_connectivity: bluetoothctl timed out')
+            results['bluetoothctl'] = 'timed out'
+        except FileNotFoundError:
+            results['bluetoothctl'] = None
+        except Exception:
+            logger.exception('verify_connectivity: bluetoothctl check failed')
+
+        # Optional BLE scan using bleak to check radio is scanning/seeing adverts
+        if do_ble_scan:
+            try:
+                try:
+                    from bleak import BleakScanner
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    devices = loop.run_until_complete(BleakScanner.discover(timeout=ble_timeout))
+                    results['ble_scan'] = len(devices) if devices is not None else 0
+                    if results['ble_scan']:
+                        results['ok'] = True
+                except Exception:
+                    logger.exception('verify_connectivity: BLE scan failed')
+                    results['ble_scan'] = None
+            finally:
+                try:
+                    asyncio.set_event_loop(None)
+                except Exception:
+                    pass
+
+        return results
 
     def toggle_bluetooth(self):
         """Toggle bluetooth: try DBus/BlueZ first, then fall back to rfkill.
@@ -980,9 +1440,18 @@ class ConsciousnessLab:
         (missing lib or permission), falls back to calling `rfkill`.
         """
         def worker():
-            self.status_bar.config(text="Toggling Bluetooth...")
+            # Update UI immediately on main thread to give feedback
+            try:
+                self.root.after(0, lambda: self.status_bar.config(text="Toggling Bluetooth..."))
+            except Exception:
+                pass
 
-            # Try BlueZ via dbus-python first (preferred for multi-user setups)
+            # Do not call tkinter APIs from this thread — collect results and apply them via root.after
+            result = {'ok': False, 'method': None, 'action': None, 'message': None}
+
+            print("toggle_bluetooth: worker started")
+            logger.debug('toggle_bluetooth: worker started')
+            # Try BlueZ via dbus-python first
             if dbus is not None:
                 try:
                     system_bus = None
@@ -1008,21 +1477,86 @@ class ConsciousnessLab:
                                 system_bus.get_object('org.bluez', adapter_path),
                                 'org.freedesktop.DBus.Properties'
                             )
-                            powered = props.Get('org.bluez.Adapter1', 'Powered')
-                            props.Set('org.bluez.Adapter1', 'Powered', dbus.Boolean(not powered))
-                            new_state = 'on' if not powered else 'off'
-                            self.status_bar.config(text=f"Bluetooth {new_state} (via BlueZ)")
-                            messagebox.showinfo('Bluetooth', f'Bluetooth turned {new_state} via BlueZ')
-                            # Update LED
-                            self._set_led(self.bt_led, 'on' if new_state == 'on' else 'off')
-                            return
+                            try:
+                                powered = bool(props.Get('org.bluez.Adapter1', 'Powered'))
+                            except Exception:
+                                powered = None
+
+                            # If we could read powered state, toggle it
+                            if powered is not None:
+                                try:
+                                    props.Set('org.bluez.Adapter1', 'Powered', dbus.Boolean(not powered))
+                                    new_state = 'on' if not powered else 'off'
+                                    result.update({'ok': True, 'method': 'bluez-dbus', 'action': new_state,
+                                                   'message': f'Bluetooth {new_state} (via BlueZ)'} )
+                                    # apply LED and message in main thread
+                                    self.root.after(0, lambda: [
+                                        self.status_bar.config(text=result['message']),
+                                        self._set_led(self.bt_led, 'on' if new_state == 'on' else 'off'),
+                                        messagebox.showinfo('Bluetooth', result['message'])
+                                    ])
+                                    logger.info('Bluetooth toggled via BlueZ DBus: %s', new_state)
+                                    return
+                                except Exception as e:
+                                    # proceed to other methods
+                                    logger.exception('DBus set failed')
                 except Exception as e:
-                    # DBus attempt failed -> fall back
-                    print(f"DBus toggle failed: {e}")
+                    logger.exception('DBus toggle failed')
+
+            # Next try bluetoothctl (supports 'power on' / 'power off' and 'show')
+            try:
+                # Determine current powered state via bluetoothctl show
+                powered = None
+                try:
+                    try:
+                        res = subprocess.run(["bluetoothctl", "show"], capture_output=True, text=True, timeout=5)
+                    except subprocess.TimeoutExpired:
+                        logger.warning('bluetoothctl show timed out (toggle)')
+                        res = None
+                    if res:
+                        out = (res.stdout or "") + (res.stderr or "")
+                        out_l = out.lower()
+                        logger.debug('bluetoothctl show output: %s', out)
+                        if "powered: yes" in out_l:
+                            powered = True
+                        elif "powered: no" in out_l:
+                            powered = False
+                except Exception:
+                    powered = None
+
+                # Decide desired action (toggle)
+                if powered is None:
+                    # If unknown, try to unblock via rfkill later — assume off and try to turn on
+                    target = 'on'
+                else:
+                    target = 'off' if powered else 'on'
+
+                logger.debug('Attempting bluetoothctl power %s', target)
+                res = self._run_with_possible_privilege(["bluetoothctl", "power", target], timeout=8)
+                logger.debug('bluetoothctl power result: %s', res)
+                if res is not None and getattr(res, 'returncode', 1) == 0:
+                    result.update({'ok': True, 'method': 'bluetoothctl', 'action': target,
+                                   'message': f'Bluetooth {target} (via bluetoothctl)'} )
+                    self.root.after(0, lambda: [
+                        self.status_bar.config(text=result['message']),
+                        self._set_led(self.bt_led, 'on' if target == 'on' else 'off'),
+                        messagebox.showinfo('Bluetooth', result['message'])
+                    ])
+                    logger.info('Bluetooth toggled via bluetoothctl: %s', target)
+                    return
+                else:
+                    if res is None:
+                        logger.debug('bluetoothctl returned no result')
+                    else:
+                        logger.debug('bluetoothctl returned %s: %s %s', getattr(res,'returncode',None), getattr(res,'stdout',''), getattr(res,'stderr',''))
+            except FileNotFoundError:
+                pass
+            except Exception as e:
+                print(f"bluetoothctl toggle failed: {e}")
 
             # Fall back to rfkill
-            state = self._get_bluetooth_state()
             try:
+                state = self._get_bluetooth_state()
                 if state == "blocked":
                     cmd = ["rfkill", "unblock", "bluetooth"]
                     action = "unblocked"
@@ -1033,23 +1567,47 @@ class ConsciousnessLab:
                     cmd = ["rfkill", "unblock", "bluetooth"]
                     action = "unblocked"
 
-                res = subprocess.run(cmd, capture_output=True, text=True)
-                if res.returncode == 0:
-                    self.status_bar.config(text=f"Bluetooth {action}")
-                    messagebox.showinfo("Bluetooth", f"Bluetooth {action} successfully.")
-                    # Update LED
-                    self._set_led(self.bt_led, 'on' if action == 'unblocked' else 'off')
+                logger.debug('Attempting rfkill command: %s', cmd)
+                res = self._run_with_possible_privilege(cmd, timeout=5)
+                logger.debug('rfkill result: %s', res)
+                if res is not None and getattr(res, 'returncode', 1) == 0:
+                    result.update({'ok': True, 'method': 'rfkill', 'action': action,
+                                   'message': f'Bluetooth {action} (via rfkill)'} )
+                    self.root.after(0, lambda: [
+                        self.status_bar.config(text=result['message']),
+                        self._set_led(self.bt_led, 'on' if action == 'unblocked' else 'off'),
+                        messagebox.showinfo('Bluetooth', result['message'])
+                    ])
+                    logger.info('Bluetooth toggled via rfkill: %s', action)
+                    return
                 else:
-                    self.status_bar.config(text="Bluetooth toggle failed")
-                    messagebox.showwarning(
-                        "Bluetooth Toggle Failed",
-                        "Could not toggle Bluetooth. Ask an admin to install a polkit rule or run:\n\nsudo rfkill unblock bluetooth\n\nCommand output:\n" + (res.stderr or res.stdout)
-                    )
+                    msg = (getattr(res, 'stderr', None) or getattr(res, 'stdout', None) or 'Unknown rfkill error')
+                    result.update({'ok': False, 'method': 'rfkill', 'message': msg})
+                    logger.debug('rfkill failed: %s', msg)
+            except FileNotFoundError:
+                result.update({'ok': False, 'method': 'none', 'message': 'rfkill not found'})
             except Exception as e:
-                self.status_bar.config(text="Bluetooth toggle error")
-                messagebox.showerror("Error", f"Bluetooth toggle failed: {e}")
+                result.update({'ok': False, 'method': 'rfkill', 'message': str(e)})
 
-        threading.Thread(target=worker, daemon=True).start()
+            # If we reached here, no method succeeded — notify user on main thread
+            def _notify_fail():
+                self.status_bar.config(text="Bluetooth toggle failed")
+                messagebox.showwarning(
+                    "Bluetooth Toggle Failed",
+                    "Could not toggle Bluetooth. Ask an admin to install a polkit rule or run:\n\nsudo rfkill unblock bluetooth\n\n" + (result.get('message') or '')
+                )
+                logger.warning('Bluetooth toggle failed: %s', result.get('message'))
+
+            self.root.after(0, _notify_fail)
+
+            # Start worker
+        try:
+            threading.Thread(target=worker, daemon=True).start()
+        except Exception as e:
+            try:
+                messagebox.showerror('Error', f'Could not start Bluetooth toggle thread: {e}')
+            except Exception:
+                print(f'Failed to start toggle thread: {e}')
 
     def seed_rng_from_sdr(self):
         """Collect entropy via SDR and seed the internal RNGCollector's DRBG.
