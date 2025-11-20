@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import messagebox, filedialog, ttk
+from tkinter import messagebox, filedialog, ttk, simpledialog
 import tkinter.scrolledtext as scrolledtext
 import threading
 import os
@@ -220,6 +220,11 @@ class ConsciousnessLab:
         help_menu.add_command(label="Troubleshooting", command=self.show_troubleshooting)
         help_menu.add_command(label="About", command=lambda: messagebox.showinfo("About", "mindfield-core — GUI v1"))
         menubar.add_cascade(label="Help", menu=help_menu)
+        # Admin Mode menu
+        mode_menu = tk.Menu(menubar, tearoff=0)
+        mode_menu.add_command(label="Switch to Self-Admin Mode", command=lambda: self.set_admin_mode('self'))
+        mode_menu.add_command(label="Enter External Admin Mode", command=self.enter_external_admin)
+        menubar.add_cascade(label="Mode", menu=mode_menu)
 
         self.root.config(menu=menubar)
         
@@ -495,8 +500,9 @@ class ConsciousnessLab:
                 },
                 'statistics': stats,
                 'comparison': comparison,
-                'markers': self.rng_collector.markers,
-                'raw_bits': list(self.rng_collector.bits)[-10000:]  # Last 10k bits
+                # Respect admin mode: if in self-admin, don't include raw bits or detailed markers
+                'markers': (self.rng_collector.markers if getattr(self, 'admin_mode', 'external') == 'external' else [{'count': len(self.rng_collector.markers)}]),
+                'raw_bits': (list(self.rng_collector.bits)[-10000:] if getattr(self, 'admin_mode', 'external') == 'external' else None)
             }
             
             # Add group session data if applicable
@@ -536,8 +542,12 @@ class ConsciousnessLab:
                     writer.writerow([])
                     writer.writerow(['Event Markers'])
                     writer.writerow(['Time', 'Event', 'Bit Index'])
-                    for m in self.rng_collector.markers:
-                        writer.writerow([m['timestamp'], m['event'], m['bit_index']])
+                    # Respect admin mode: redact detailed markers if self-admin
+                    if getattr(self, 'admin_mode', 'external') == 'external':
+                        for m in self.rng_collector.markers:
+                            writer.writerow([m.get('timestamp'), m.get('event'), m.get('bit_index')])
+                    else:
+                        writer.writerow(['(redacted in self-admin mode)', '', ''])
                         
         # Save group metadata if group session
         if self.current_session_type == "group" and self.group_manager:
@@ -563,6 +573,67 @@ class ConsciousnessLab:
                 label_widget.config(bg="#95a5a6")
         except Exception:
             pass
+
+    def enter_external_admin(self):
+        """Attempt to enter External Admin mode. Requires password if MINDFIELD_ADMIN_PASS is set."""
+        try:
+            env_pass = os.environ.get('MINDFIELD_ADMIN_PASS')
+            if env_pass:
+                pw = simpledialog.askstring("Admin Password", "Enter external admin password:", show='*')
+                if pw is None:
+                    return
+                if pw != env_pass:
+                    messagebox.showerror("Access Denied", "Incorrect admin password")
+                    return
+            else:
+                # No environment password configured — warn but allow
+                if not messagebox.askyesno("No Admin Password", "No external admin password is configured (MINDFIELD_ADMIN_PASS). Continue and enable External Admin mode without a password?"):
+                    return
+
+            self.set_admin_mode('external')
+            messagebox.showinfo("External Admin", "External Admin mode enabled")
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not enable external admin: {e}")
+
+    def set_admin_mode(self, mode: str):
+        """Set admin mode. mode is 'self' or 'external'. Adjust UI and data visibility accordingly."""
+        try:
+            mode = mode.lower()
+            if mode not in ('self', 'external'):
+                raise ValueError('mode must be self or external')
+            self.admin_mode = mode
+
+            # Update title/status to show current mode
+            self.root.title(f"mindfield-core [{'Self-Admin' if mode=='self' else 'External Admin'}]")
+            self.status_bar.config(text=f"Mode: {'Self-Admin (limited view)' if mode=='self' else 'External Admin (full view)'}")
+
+            # When in self-admin, hide sensitive displays
+            if mode == 'self':
+                try:
+                    # Mask stats and coherence
+                    self.stats_label.config(text="Statistics hidden in Self-Admin Mode")
+                    self.coherence_label.config(text="Coherence hidden in Self-Admin Mode")
+                except Exception:
+                    pass
+
+                # Mask participant labels if visible
+                try:
+                    for addr, lbl in getattr(self, 'participant_labels', {}).items():
+                        lbl.config(text="Hidden (self-admin)")
+                except Exception:
+                    pass
+            else:
+                # External admin — restore placeholders; live updates will repopulate
+                try:
+                    self.stats_label.config(text="Waiting to start...")
+                    self.coherence_label.config(text="")
+                    # If there are participant labels, mark as waiting for data
+                    for addr, lbl in getattr(self, 'participant_labels', {}).items():
+                        lbl.config(text="-- waiting --")
+                except Exception:
+                    pass
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not set admin mode: {e}")
 
     def show_troubleshooting(self):
         """Open a small dialog showing polkit and udev guidance for Bluetooth and SDR access."""
