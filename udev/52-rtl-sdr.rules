@@ -1,0 +1,11 @@
+# udev rules for RTL-SDR / Nooelec devices
+# Install as root to allow non-root users in group 'plugdev' to access the device.
+# Save to /etc/udev/rules.d/52-rtl-sdr.rules
+
+# Nooelec NESDR (RTL2838)
+SUBSYSTEMS=="usb", ATTRS{idVendor}=="0bda", ATTRS{idProduct}=="2838", MODE:="0660", GROUP:="plugdev"
+# Common RTL2832U variants
+SUBSYSTEMS=="usb", ATTRS{idVendor}=="0bda", ATTRS{idProduct}=="2832", MODE:="0660", GROUP:="plugdev"
+
+# Optional: allow all Realtek RTL2832U devices
+SUBSYSTEMS=="usb", ATTRS{idVendor}=="0bda", ENV{DEVTYPE}=="usb_device", MODE:="0660", GROUP:="plugdev"

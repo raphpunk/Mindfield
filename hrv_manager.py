@@ -1,166 +1,176 @@
 import asyncio
-from bleak import BleakScanner, BleakClient
+import subprocess
+from datetime import datetime
+from queue import Queue
 import threading
-import queue
-import struct
+from bleak import BleakClient, BleakScanner
+from typing import Dict, List, Optional
 import numpy as np
-import time
 
 class HRVDeviceManager:
-    def __init__(self):
-        self.devices = {}
-        self.active_clients = {}
-        self.coherence_queue = queue.Queue()
+    def __init__(self, coherence_queue: Queue):
+        self.coherence_queue = coherence_queue
+        self.device_patterns = ['Polar', 'Wahoo', '808S', 'HRM', 'Heart Rate']
+        self.active_devices = {}
+        self.monitor_tasks = {}
+        self.running = False
+        self.latest_coherence = []
+        self._async_loop = None
+        self._thread = None
         
-        # Standard BLE Heart Rate UUIDs
+        # BLE UUIDs
         self.HR_SERVICE_UUID = "0000180d-0000-1000-8000-00805f9b34fb"
         self.HR_MEASUREMENT_UUID = "00002a37-0000-1000-8000-00805f9b34fb"
         
-        # Device patterns to recognize
-        self.device_patterns = [
-            "Polar", "H808S", "H10", "H9", "OH1",
-            "Garmin", "HRM-Dual", "HRM-Pro", "HRM-Run",
-            "Wahoo", "TICKR", "TICKR X",
-            "Suunto", "Smart Sensor",
-            "Zephyr", "HxM",
-            "RHYTHM", "Scosche",
-            "HRM", "Heart Rate"  # Generic patterns
-        ]
-        
-        self.rr_buffers = {}  # Store RR intervals per device
-        
-    async def scan_devices(self, timeout=10):
-        devices = await BleakScanner.discover(timeout=timeout)
-        hrv_devices = []
-        
-        for d in devices:
-            if d.name:
-                # Check if it matches any known patterns
-                for pattern in self.device_patterns:
-                    if pattern.lower() in d.name.lower():
-                        hrv_devices.append({
-                            'name': d.name,
-                            'address': d.address,
-                            'rssi': d.rssi
-                        })
-                        break
-                        
-        # Sort by signal strength
-        hrv_devices.sort(key=lambda x: x['rssi'], reverse=True)
-        return hrv_devices
+    async def scan_devices(self):
+        """Scan for available HRV devices"""
+        devices = await BleakScanner.discover(timeout=5)
+        return [{'name': d.name, 'address': d.address, 'rssi': getattr(d, 'rssi', -99)} 
+                for d in devices if d.name and any(p in d.name for p in self.device_patterns)]
     
-    def connect_devices(self, selected_addresses):
-        for addr in selected_addresses:
-            self.rr_buffers[addr] = deque(maxlen=120)  # 2 minutes of RR data
-            thread = threading.Thread(target=self._run_device, args=(addr,))
-            thread.daemon = True
-            thread.start()
-    
-    def _run_device(self, address):
-        asyncio.run(self._monitor_device(address))
-    
+    def connect_devices(self, addresses):
+        """Connect to selected devices"""
+        for addr in addresses:
+            self.active_devices[addr] = "Connecting..."
+            
+        # If async loop not running, start it
+        if not self._thread or not self._thread.is_alive():
+            self._thread = threading.Thread(target=self._run_async_loop, daemon=True)
+            self._thread.start()
+            
+    def _run_async_loop(self):
+        """Run the async event loop in a separate thread"""
+        self._async_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._async_loop)
+        self._async_loop.run_until_complete(self._async_main())
+        
+    async def _async_main(self):
+        """Main async loop"""
+        self.running = True
+        
+        # Start monitors for all active devices
+        for addr in list(self.active_devices.keys()):
+            task = asyncio.create_task(self._monitor_device(addr))
+            self.monitor_tasks[addr] = task
+            
+        # Keep running until stopped
+        while self.running:
+            await asyncio.sleep(1)
+            
     async def _monitor_device(self, address):
-        try:
-            async with BleakClient(address) as client:
-                print(f"Connected to {address}")
+        """Monitor a specific device with resilient connection"""
+        device_name = self.active_devices.get(address, "Unknown")
+        is_808s = "808S" in device_name or "808S" in str(address)
+        max_retries = 5 if is_808s else 3
+        
+        for attempt in range(max_retries):
+            try:
+                # Force clean state for 808S
+                if is_808s and attempt > 0:
+                    print(f"Resetting BLE for {address}...")
+                    subprocess.run(["sudo", "hciconfig", "hci0", "reset"], capture_output=True)
+                    await asyncio.sleep(2)
+                    
+                client = BleakClient(address, timeout=30 if is_808s else 10)
+                await client.connect()
                 
+                # Verify services available
+                if not client.services:
+                    print(f"No services found for {address}")
+                    await client.disconnect()
+                    continue
+                    
+                print(f"Connected to {address} (attempt {attempt + 1})")
+                self.active_devices[address] = "Connected"
+                
+                # Set up notification handler
                 def handler(sender, data):
                     hr_data = self._parse_hr_data(data, address)
                     if hr_data:
                         self.coherence_queue.put(hr_data)
-                
-                # Start notifications
+                        self.latest_coherence.append(hr_data)
+                        if len(self.latest_coherence) > 100:
+                            self.latest_coherence.pop(0)
+                        
                 await client.start_notify(self.HR_MEASUREMENT_UUID, handler)
                 
                 # Keep connection alive
-                while client.is_connected:
+                while client.is_connected and self.running:
                     await asyncio.sleep(1)
                     
+                await client.stop_notify(self.HR_MEASUREMENT_UUID)
+                await client.disconnect()
+                
+            except Exception as e:
+                print(f"Device {address} error: {e}")
+                if attempt == max_retries - 1:
+                    self.coherence_queue.put({
+                        'timestamp': datetime.now().timestamp(),
+                        'device': address,
+                        'error': str(e),
+                        'coherence': 0,
+                        'heart_rate': 0,
+                        'rr_intervals': []
+                    })
+                    
+        # Cleanup on disconnect
+        self.active_devices.pop(address, None)
+        self.monitor_tasks.pop(address, None)
+        
+    def _parse_hr_data(self, data, address) -> Optional[Dict]:
+        """Parse BLE heart rate measurement data"""
+        try:
+            flags = data[0]
+            hr_format = flags & 0x01
+            
+            # Parse heart rate
+            if hr_format == 0:
+                hr = data[1]
+                rr_offset = 2
+            else:
+                hr = int.from_bytes(data[1:3], 'little')
+                rr_offset = 3
+                
+            # Parse RR intervals
+            rr_intervals = []
+            if flags & 0x10:  # RR interval data present
+                i = rr_offset
+                while i < len(data) - 1:
+                    rr_raw = int.from_bytes(data[i:i+2], 'little')
+                    rr_ms = rr_raw * 1000 / 1024  # Convert to milliseconds
+                    rr_intervals.append(rr_ms)
+                    i += 2
+                    
+            # Calculate simple coherence
+            coherence = 0
+            if len(rr_intervals) >= 3:
+                rr_diff = np.diff(rr_intervals)
+                if np.std(rr_diff) > 0:
+                    coherence = 1 / (1 + np.std(rr_diff) / 100)
+                    
+            return {
+                'timestamp': datetime.now().timestamp(),
+                'device': address,
+                'heart_rate': hr,
+                'rr_intervals': rr_intervals,
+                'coherence': coherence
+            }
+            
         except Exception as e:
-            print(f"Device {address} error: {e}")
-            self.coherence_queue.put({
-                'device': address[-5:],
-                'error': str(e),
-                'coherence': 0
-            })
-    
-    def _parse_hr_data(self, data, address):
-        """Parse heart rate data according to BLE spec"""
-        if len(data) < 2:
+            print(f"Parse error for {address}: {e}")
             return None
             
-        # First byte contains flags
-        flags = data[0]
-        hr_format = flags & 0x01
-        rr_present = (flags & 0x10) != 0
-        
-        # Parse heart rate
-        if hr_format == 0:  # uint8
-            hr = data[1]
-            rr_offset = 2
-        else:  # uint16
-            hr = struct.unpack('<H', data[1:3])[0]
-            rr_offset = 3
-            
-        # Parse RR intervals if present
-        rr_intervals = []
-        if rr_present:
-            while rr_offset + 1 < len(data):
-                rr = struct.unpack('<H', data[rr_offset:rr_offset+2])[0]
-                rr_ms = rr * 1000 / 1024  # Convert to milliseconds
-                rr_intervals.append(rr_ms)
-                self.rr_buffers[address].append(rr_ms)
-                rr_offset += 2
-        
-        # Calculate coherence from buffer
-        coherence = self._calculate_coherence(address)
-        
-        return {
-            'device': address[-5:],
-            'hr': hr,
-            'rr_count': len(rr_intervals),
-            'coherence': coherence,
-            'timestamp': time.time()
-        }
+    def get_all_coherence(self) -> List[Dict]:
+        """Return latest coherence data"""
+        return self.latest_coherence[-10:] if self.latest_coherence else []
     
-    def _calculate_coherence(self, address):
-        """Calculate HRV coherence (0-1 scale)"""
-        rr_data = list(self.rr_buffers[address])
-        
-        if len(rr_data) < 10:
-            return 0.0
-            
-        # Simple coherence: inverse of RR variance normalized
-        rr_array = np.array(rr_data)
-        
-        # Calculate successive differences
-        diff = np.diff(rr_array)
-        
-        # RMSSD (Root Mean Square of Successive Differences)
-        rmssd = np.sqrt(np.mean(diff**2))
-        
-        # Normalize to 0-1 (lower RMSSD = higher coherence)
-        # Typical RMSSD ranges from 20-100ms
-        coherence = 1 / (1 + rmssd / 50)
-        
-        return min(max(coherence, 0), 1)  # Clamp to 0-1
+    def get_active_devices(self) -> List[str]:
+        """Return list of currently connected devices"""
+        return list(self.active_devices.keys())
     
-    def get_all_coherence(self):
-        """Get all recent coherence data"""
-        data = []
-        while not self.coherence_queue.empty():
-            try:
-                item = self.coherence_queue.get_nowait()
-                if 'error' not in item:
-                    data.append(item)
-            except:
-                break
-        return data
-    
-    def disconnect_all(self):
-        """Clean disconnect all devices"""
-        # In real implementation, would track clients and disconnect
-        pass
-
-# Import deque at top if not already
-from collections import deque
+    def stop(self):
+        """Stop all monitoring"""
+        self.running = False
+        if self._async_loop and self._thread:
+            self._async_loop.call_soon_threadsafe(self._async_loop.stop)
+            self._thread.join(timeout=5)

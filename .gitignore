@@ -1,0 +1,19 @@
+# Virtual environment
+.venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Logs
+*.log
+
+# Local app state
+.mindfield_seen
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/

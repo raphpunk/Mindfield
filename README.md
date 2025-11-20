@@ -106,6 +106,47 @@ sudo apt install bluez  # Linux only
 
 **Permission errors**: May need to run with sudo on Linux for BLE scanning
 
+## SDR (Nooelec / RTL-SDR) Setup (optional)
+
+This project can use a Nooelec/RTL-SDR device as an entropy source for seeding the RNG. The SDR path is optional — the software RNG fallback will be used if an SDR is not available.
+
+1. Install system packages (Debian/Ubuntu):
+
+```bash
+sudo apt-get update
+sudo apt-get install -y rtl-sdr librtlsdr-dev librtlsdr0
+```
+
+2. Install Python dependencies in a virtual environment (recommended):
+
+```bash
+./scripts/setup-env.sh
+source .venv/bin/activate
+```
+
+3. Allow non-root access to the SDR device (one-time admin step):
+
+```bash
+sudo cp udev/52-rtl-sdr.rules /etc/udev/rules.d/52-rtl-sdr.rules
+sudo udevadm control --reload-rules
+sudo udevadm trigger
+sudo usermod -aG plugdev $USER
+# Log out and log back in (or run `newgrp plugdev`) to apply group changes.
+```
+
+4. Test SDR availability and collect a seed (verbose):
+
+```bash
+source .venv/bin/activate
+python sdr_rng.py -n 32 --verbose
+```
+
+If the script prints `SDR: used RTL-SDR to collect entropy`, the SDR path is working.
+
+Notes:
+- The SDR-based entropy is whitened (SHA-256) before use and is combined into an internal DRBG. For production/high-assurance use, follow NIST SP800-90 recommendations and run continuous health tests.
+- See `POLKIT_RULES.md` for guidance on polkit rules if you want to manage Bluetooth via DBus without sudo.
+
 ## Contributing
 
 This is experimental research software. Pull requests welcome for:
