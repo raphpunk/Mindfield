@@ -165,6 +165,9 @@ class ConsciousnessLab:
 
         self.countdown_label = tk.Label(right_controls, text="Time left: --:--", width=14)
         self.countdown_label.grid(row=0, column=2, padx=(10,0))
+        # Subject info shown only to external admins
+        self.subject_info_label = tk.Label(right_controls, text="Subject: (none)", width=28, anchor='w', bg=self.bg_color)
+        self.subject_info_label.grid(row=1, column=0, columnspan=3, pady=(6,0))
         
         # Quick Actions
         action_frame = tk.Frame(self.root, bg=self.bg_color)
@@ -307,6 +310,18 @@ class ConsciousnessLab:
             
             # Connect devices
             self.hrv_manager.connect_devices(list(assignments['participants'].keys()))
+            # If in external admin mode, show subject info (first participant)
+            try:
+                if getattr(self, 'admin_mode', 'external') == 'external':
+                    first = next(iter(assignments['participants'].values()))
+                    name = first.get('name') if isinstance(first, dict) else str(first)
+                    try:
+                        self.subject_info_label.config(text=f"Subject: {name}")
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
             self.toggle_session("experiment")
             
     def setup_participant_display(self, participants):
@@ -336,9 +351,16 @@ class ConsciousnessLab:
             # For individual sessions, connect selected devices
             if self.current_session_type == "individual":
                 selected = [addr for var, addr, _ in self.device_vars if var.get()]
+                selected_names = [name for var, addr, name in self.device_vars if var.get()]
                 if selected:
                     self.hrv_manager.connect_devices(selected)
                     self.status_bar.config(text=f"Connected to {len(selected)} device(s)")
+                    # If in external admin mode, show the subject name
+                    try:
+                        if getattr(self, 'admin_mode', 'external') == 'external' and selected_names:
+                            self.subject_info_label.config(text=f"Subject: {selected_names[0]}")
+                    except Exception:
+                        pass
             
             # Start RNG collection
             self.running = True
@@ -575,21 +597,8 @@ class ConsciousnessLab:
             pass
 
     def enter_external_admin(self):
-        """Attempt to enter External Admin mode. Requires password if MINDFIELD_ADMIN_PASS is set."""
+        """Enter External Admin mode (no password required)."""
         try:
-            env_pass = os.environ.get('MINDFIELD_ADMIN_PASS')
-            if env_pass:
-                pw = simpledialog.askstring("Admin Password", "Enter external admin password:", show='*')
-                if pw is None:
-                    return
-                if pw != env_pass:
-                    messagebox.showerror("Access Denied", "Incorrect admin password")
-                    return
-            else:
-                # No environment password configured — warn but allow
-                if not messagebox.askyesno("No Admin Password", "No external admin password is configured (MINDFIELD_ADMIN_PASS). Continue and enable External Admin mode without a password?"):
-                    return
-
             self.set_admin_mode('external')
             messagebox.showinfo("External Admin", "External Admin mode enabled")
         except Exception as e:
@@ -607,29 +616,92 @@ class ConsciousnessLab:
             self.root.title(f"mindfield-core [{'Self-Admin' if mode=='self' else 'External Admin'}]")
             self.status_bar.config(text=f"Mode: {'Self-Admin (limited view)' if mode=='self' else 'External Admin (full view)'}")
 
-            # When in self-admin, hide sensitive displays
+            # When in self-admin, minimize UI to timer-only view
             if mode == 'self':
                 try:
-                    # Mask stats and coherence
-                    self.stats_label.config(text="Statistics hidden in Self-Admin Mode")
-                    self.coherence_label.config(text="Coherence hidden in Self-Admin Mode")
+                    # Disable action buttons
+                    for btn in (getattr(self, 'baseline_btn', None), getattr(self, 'experiment_btn', None),
+                                getattr(self, 'mark_btn', None), getattr(self, 'group_btn', None),
+                                getattr(self, 'export_btn', None), getattr(self, 'toggle_bt_btn', None),
+                                getattr(self, 'seed_btn', None), getattr(self, 'scan_btn', None)):
+                        if btn is not None:
+                            try:
+                                btn.state(['disabled'])
+                            except Exception:
+                                try:
+                                    btn.config(state='disabled')
+                                except Exception:
+                                    pass
+
+                    # Hide stats and participant displays
+                    try:
+                        self.stats_label.pack_forget()
+                    except Exception:
+                        pass
+                    try:
+                        self.effect_label.pack_forget()
+                    except Exception:
+                        pass
+                    try:
+                        self.coherence_label.pack_forget()
+                    except Exception:
+                        pass
+                    try:
+                        self.participant_frame.pack_forget()
+                    except Exception:
+                        pass
+
+                    # Clear subject info (don't show subject to test-taker)
+                    try:
+                        self.subject_info_label.config(text="Subject: (hidden)")
+                    except Exception:
+                        pass
                 except Exception:
                     pass
 
-                # Mask participant labels if visible
-                try:
-                    for addr, lbl in getattr(self, 'participant_labels', {}).items():
-                        lbl.config(text="Hidden (self-admin)")
-                except Exception:
-                    pass
             else:
-                # External admin — restore placeholders; live updates will repopulate
+                # External admin — restore UI and enable buttons
                 try:
-                    self.stats_label.config(text="Waiting to start...")
-                    self.coherence_label.config(text="")
-                    # If there are participant labels, mark as waiting for data
-                    for addr, lbl in getattr(self, 'participant_labels', {}).items():
-                        lbl.config(text="-- waiting --")
+                    for btn in (getattr(self, 'baseline_btn', None), getattr(self, 'experiment_btn', None),
+                                getattr(self, 'mark_btn', None), getattr(self, 'group_btn', None),
+                                getattr(self, 'export_btn', None), getattr(self, 'toggle_bt_btn', None),
+                                getattr(self, 'seed_btn', None), getattr(self, 'scan_btn', None)):
+                        if btn is not None:
+                            try:
+                                btn.state(['!disabled'])
+                            except Exception:
+                                try:
+                                    btn.config(state='normal')
+                                except Exception:
+                                    pass
+
+                    # Restore stats labels
+                    try:
+                        # If they were removed, re-pack/place
+                        self.stats_label.pack(pady=5)
+                    except Exception:
+                        pass
+                    try:
+                        self.effect_label.pack()
+                    except Exception:
+                        pass
+                    try:
+                        self.coherence_label.pack()
+                    except Exception:
+                        pass
+
+                    # Restore participant frame if participants exist
+                    try:
+                        if getattr(self, 'participant_labels', {}):
+                            self.participant_frame.pack(fill="x", padx=20, pady=5, before=self.status_bar)
+                    except Exception:
+                        pass
+
+                    # Subject info label will be updated when a session is started
+                    try:
+                        self.subject_info_label.config(text="Subject: (none)")
+                    except Exception:
+                        pass
                 except Exception:
                     pass
         except Exception as e:
